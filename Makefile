@@ -1,4 +1,4 @@
-.PHONY: install lint format test clean
+.PHONY: install lint lint-check format format-check test clean
 
 VENV_DIR = .venv
 UV = uv
@@ -10,8 +10,14 @@ install:
 lint: install
 	$(UV) run ruff check --fix .
 
+lint-check: install
+	$(UV) run ruff check .
+
 format: install
 	$(UV) run ruff format .
+
+format-check: install
+	$(UV) run ruff format --check .
 
 test: install
 	$(UV) run pytest tests/

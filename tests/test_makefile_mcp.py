@@ -5,15 +5,16 @@ Comprehensive test suite for the Makefile MCP Server
 Tests Makefile parsing, target filtering, tool creation, and command execution.
 """
 
-import pytest
-import tempfile
 import os
 import pathlib
-from unittest.mock import patch, MagicMock
 import subprocess
 
 # Import the makefile MCP components
 import sys
+import tempfile
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -341,7 +342,10 @@ clean:
             assert result["status"] == "success"
             assert result["target"] == "build"
             assert result["exit_code"] == 0
-            assert result["stdout"] == "Building project...\n"
+            assert result["stdout_tail"] == "Building project...\n"
+            assert result["execution_id"] >= 1
+            assert result["stdout_total_lines"] == 1
+            assert result["stdout_total_chars"] == len("Building project...\n")
             assert "Successfully executed target 'build'" in result["message"]
 
             # Verify subprocess was called correctly
@@ -593,6 +597,280 @@ class TestErrorHandling:
                 assert result["exit_code"] == -1
         finally:
             os.unlink(makefile_path)
+
+
+class TestOutputCache:
+    """Test the OutputCache class."""
+
+    def _get_cache(self, max_entries=20):
+        from makefile_mcp import OutputCache
+
+        return OutputCache(max_entries=max_entries)
+
+    def test_add_and_get(self):
+        """Test adding and retrieving entries."""
+        cache = self._get_cache()
+        entry = cache.add("build", "make build", "hello\nworld\n", "warn\n", 0)
+
+        assert entry.execution_id == 1
+        assert entry.target == "build"
+        assert entry.stdout == "hello\nworld\n"
+        assert entry.stderr == "warn\n"
+        assert entry.exit_code == 0
+
+        retrieved = cache.get(1)
+        assert retrieved is entry
+
+    def test_auto_increment_id(self):
+        """Test that execution IDs auto-increment."""
+        cache = self._get_cache()
+        e1 = cache.add("a", "make a", "", "", 0)
+        e2 = cache.add("b", "make b", "", "", 0)
+        e3 = cache.add("c", "make c", "", "", 0)
+        assert e1.execution_id == 1
+        assert e2.execution_id == 2
+        assert e3.execution_id == 3
+
+    def test_eviction(self):
+        """Test that oldest entries are evicted when over limit."""
+        cache = self._get_cache(max_entries=3)
+        cache.add("a", "make a", "out_a", "", 0)
+        cache.add("b", "make b", "out_b", "", 0)
+        cache.add("c", "make c", "out_c", "", 0)
+        assert len(cache) == 3
+
+        # Adding a 4th should evict the oldest (id=1)
+        cache.add("d", "make d", "out_d", "", 0)
+        assert len(cache) == 3
+        assert cache.get(1) is None
+        assert cache.get(2) is not None
+        assert cache.get(4) is not None
+
+    def test_get_missing_id(self):
+        """Test that getting a non-existent ID returns None."""
+        cache = self._get_cache()
+        assert cache.get(999) is None
+
+
+class TestTailTruncation:
+    """Test the tail-line truncation behavior in make tool responses."""
+
+    @patch("subprocess.run")
+    def test_short_output_not_truncated(self, mock_run):
+        """Output shorter than tail_lines should not be truncated."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "line1\nline2\nline3\n"
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        with patch("sys.argv", ["makefile_mcp.py", "--tail-lines", "50"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("build", "Build")
+            result = make_tool()
+
+            assert result["stdout_tail"] == "line1\nline2\nline3\n"
+            assert "truncation_note" not in result
+
+    @patch("subprocess.run")
+    def test_long_output_truncated(self, mock_run):
+        """Output longer than tail_lines should be truncated to last N lines."""
+        lines = [f"line{i}" for i in range(100)]
+        full_output = "\n".join(lines) + "\n"
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = full_output
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        with patch("sys.argv", ["makefile_mcp.py", "--tail-lines", "5"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("build", "Build")
+            result = make_tool()
+
+            # Should only have the last 5 lines
+            tail_lines = result["stdout_tail"].splitlines()
+            assert len(tail_lines) == 5
+            assert tail_lines[0] == "line95"
+            assert tail_lines[4] == "line99"
+
+            assert result["stdout_total_lines"] == 100
+            assert "truncation_note" in result
+            assert "get_output" in result["truncation_note"]
+
+    @patch("subprocess.run")
+    def test_execution_id_in_response(self, mock_run):
+        """Response should include execution_id for cache retrieval."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok\n"
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        with patch("sys.argv", ["makefile_mcp.py"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("test", "Test")
+            result = make_tool()
+            assert "execution_id" in result
+            assert isinstance(result["execution_id"], int)
+
+
+class TestGetOutput:
+    """Test the get_output MCP tool."""
+
+    def _setup(self):
+        """Set up a module with cached output."""
+        with patch("sys.argv", ["makefile_mcp.py"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            # Directly add to cache
+            lines = [f"line{i}" for i in range(20)]
+            full_output = "\n".join(lines) + "\n"
+            entry = makefile_mcp.output_cache.add("test", "make test", full_output, "err0\nerr1\n", 0)
+            return makefile_mcp, entry.execution_id
+
+    def test_basic_pagination(self):
+        """Test retrieving a range of lines."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.get_output(eid, stream="stdout", start_line=0, end_line=5)
+
+        assert result["status"] == "success"
+        assert result["execution_id"] == eid
+        content_lines = result["content"].splitlines()
+        assert len(content_lines) == 5
+        assert content_lines[0] == "line0"
+        assert content_lines[4] == "line4"
+        assert result["total_lines"] == 20
+
+    def test_middle_range(self):
+        """Test retrieving lines from the middle."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.get_output(eid, stream="stdout", start_line=10, end_line=13)
+        content_lines = result["content"].splitlines()
+        assert content_lines[0] == "line10"
+        assert content_lines[2] == "line12"
+
+    def test_stderr_stream(self):
+        """Test reading from stderr."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.get_output(eid, stream="stderr", start_line=0, end_line=100)
+        assert result["status"] == "success"
+        assert "err0" in result["content"]
+        assert result["total_lines"] == 2
+
+    def test_out_of_range_clamped(self):
+        """Test that out-of-range line numbers are clamped."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.get_output(eid, stream="stdout", start_line=0, end_line=9999)
+        assert result["status"] == "success"
+        assert result["end_line"] == result["total_lines"]
+
+    def test_missing_execution_id(self):
+        """Test error for missing execution ID."""
+        makefile_mcp, _eid = self._setup()
+        result = makefile_mcp.get_output(99999)
+        assert result["status"] == "error"
+        assert "not found" in result["message"]
+
+    def test_invalid_stream(self):
+        """Test error for invalid stream name."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.get_output(eid, stream="invalid")
+        assert result["status"] == "error"
+        assert "Invalid stream" in result["message"]
+
+
+class TestSearchOutput:
+    """Test the search_output MCP tool."""
+
+    def _setup(self):
+        """Set up a module with cached output."""
+        with patch("sys.argv", ["makefile_mcp.py"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            output = "Starting build\nCompiling main.c\nWARNING: deprecated function\nCompiling util.c\nLinking...\nWARNING: unused variable\nBuild complete\n"
+            entry = makefile_mcp.output_cache.add("build", "make build", output, "", 0)
+            return makefile_mcp, entry.execution_id
+
+    def test_basic_search(self):
+        """Test basic substring search."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "WARNING")
+
+        assert result["status"] == "success"
+        assert result["total_matches"] == 2
+        assert result["matches"][0]["line_number"] == 2
+        assert "deprecated" in result["matches"][0]["text"]
+        assert result["matches"][1]["line_number"] == 5
+
+    def test_case_insensitive(self):
+        """Test that search is case-insensitive."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "warning")
+        assert result["total_matches"] == 2
+
+    def test_context_lines(self):
+        """Test that context lines are included."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "WARNING", context_lines=1)
+        match = result["matches"][0]
+        context = match["context"]
+
+        # Should have line before, the match, and line after
+        assert len(context) == 3
+        assert context[0]["is_match"] is False
+        assert context[1]["is_match"] is True
+        assert context[2]["is_match"] is False
+
+    def test_no_matches(self):
+        """Test search with no results."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "NONEXISTENT_PATTERN")
+        assert result["status"] == "success"
+        assert result["total_matches"] == 0
+        assert result["matches"] == []
+
+    def test_missing_execution_id(self):
+        """Test error for missing execution ID."""
+        makefile_mcp, _eid = self._setup()
+        result = makefile_mcp.search_output(99999, "test")
+        assert result["status"] == "error"
+
+    def test_search_stderr(self):
+        """Test searching stderr stream."""
+        with patch("sys.argv", ["makefile_mcp.py"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            entry = makefile_mcp.output_cache.add("t", "make t", "", "error: foo\nwarning: bar\n", 1)
+            result = makefile_mcp.search_output(entry.execution_id, "error", stream="stderr")
+            assert result["total_matches"] == 1
+            assert result["matches"][0]["line_number"] == 0
+
+    def test_line_numbers_for_followup(self):
+        """Test that match line numbers can be used with get_output."""
+        makefile_mcp, eid = self._setup()
+        search_result = makefile_mcp.search_output(eid, "WARNING")
+
+        # Use first match line number with get_output
+        line_num = search_result["matches"][0]["line_number"]
+        get_result = makefile_mcp.get_output(eid, start_line=line_num, end_line=line_num + 1)
+        assert "WARNING" in get_result["content"]
 
 
 if __name__ == "__main__":

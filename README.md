@@ -12,31 +12,36 @@ A Model Context Protocol (MCP) server that exposes Makefile targets as executabl
 - **Include/Exclude Filtering**: Filter which targets are exposed as tools via command-line flags
 - **Dry Run Support**: Execute targets with `--dry-run` to see what would be executed
 
-## Installation
-
-Requires Python 3.10+ and `uv`.
+## Install
 
 ```bash
-uv pip install -e ".[dev]"
+# Run directly from GitHub (no install needed)
+uvx --from git+https://github.com/wdm0006/makefile-mcp makefile-mcp --makefile /path/to/Makefile
+
+# Or install from source
+git clone https://github.com/wdm0006/makefile-mcp
+cd makefile-mcp
+uv sync
+uv run makefile_mcp.py --makefile /path/to/Makefile
 ```
 
 ## Usage
 
 ```bash
 # Use default Makefile in current directory
-uv run makefile_mcp.py
+makefile-mcp
 
 # Use specific Makefile
-uv run makefile_mcp.py --makefile /path/to/Makefile
+makefile-mcp --makefile /path/to/Makefile
 
 # Include only specific targets
-uv run makefile_mcp.py --include build,test,clean
+makefile-mcp --include build,test,clean
 
 # Exclude specific targets
-uv run makefile_mcp.py --exclude deploy,publish
+makefile-mcp --exclude deploy,publish
 
 # Custom working directory
-uv run makefile_mcp.py --working-dir /path/to/project
+makefile-mcp --working-dir /path/to/project
 ```
 
 ## MCP Client Configuration
@@ -45,10 +50,10 @@ uv run makefile_mcp.py --working-dir /path/to/project
 {
   "mcpServers": {
     "makefile": {
-      "command": "uv",
+      "command": "uvx",
       "args": [
-        "--directory", "/path/to/makefile-mcp",
-        "run", "makefile_mcp.py",
+        "--from", "git+https://github.com/wdm0006/makefile-mcp",
+        "makefile-mcp",
         "--makefile", "/path/to/your/project/Makefile",
         "--exclude", "deploy,publish"
       ]

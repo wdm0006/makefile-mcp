@@ -20,9 +20,62 @@ import pathlib
 import re
 import subprocess
 import sys
-from typing import Dict, Optional, Set, Any
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set
 
 from fastmcp import FastMCP
+
+
+@dataclass
+class CachedExecution:
+    """Cached output from a make target execution."""
+
+    execution_id: int
+    target: str
+    command: str
+    stdout: str
+    stderr: str
+    exit_code: int
+    timestamp: float
+
+
+class OutputCache:
+    """Cache for make target execution outputs with eviction."""
+
+    def __init__(self, max_entries: int = 20):
+        self.max_entries = max_entries
+        self._cache: Dict[int, CachedExecution] = {}
+        self._next_id: int = 1
+
+    def add(self, target: str, command: str, stdout: str, stderr: str, exit_code: int) -> CachedExecution:
+        """Store an execution result and return it. Evicts oldest if over limit."""
+        entry = CachedExecution(
+            execution_id=self._next_id,
+            target=target,
+            command=command,
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            timestamp=time.time(),
+        )
+        self._cache[self._next_id] = entry
+        self._next_id += 1
+
+        # Evict oldest entries if over limit
+        while len(self._cache) > self.max_entries:
+            oldest_id = min(self._cache.keys())
+            del self._cache[oldest_id]
+
+        return entry
+
+    def get(self, execution_id: int) -> Optional[CachedExecution]:
+        """Retrieve a cached execution by ID."""
+        return self._cache.get(execution_id)
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
 
 # Global variables
 MAKEFILE_PATH = None
@@ -45,10 +98,16 @@ def parse_cli_args():
         "--working-dir", type=str, help="Working directory for make commands (default: directory containing Makefile)"
     )
     parser.add_argument(
-        "--max-output-tokens",
+        "--max-cached-executions",
         type=int,
-        default=25000,
-        help="Maximum number of tokens to return from command output (default: 25000)",
+        default=20,
+        help="Maximum number of cached execution outputs to keep (default: 20)",
+    )
+    parser.add_argument(
+        "--tail-lines",
+        type=int,
+        default=50,
+        help="Number of tail lines to include in make tool responses (default: 50)",
     )
 
     known_args, _ = parser.parse_known_args()
@@ -104,14 +163,17 @@ else:
 # Parse include/exclude lists
 INCLUDE_TARGETS: Optional[Set[str]] = None
 if cli_args.include:
-    INCLUDE_TARGETS = set(target.strip() for target in cli_args.include.split(","))
+    INCLUDE_TARGETS = {target.strip() for target in cli_args.include.split(",")}
 
 EXCLUDE_TARGETS: Set[str] = set()
 if cli_args.exclude:
-    EXCLUDE_TARGETS = set(target.strip() for target in cli_args.exclude.split(","))
+    EXCLUDE_TARGETS = {target.strip() for target in cli_args.exclude.split(",")}
 
 # MCP Server instance
 mcp_server = FastMCP("MakefileMCP")
+
+# Output cache instance
+output_cache = OutputCache(max_entries=cli_args.max_cached_executions)
 
 
 class MakefileParser:
@@ -214,12 +276,20 @@ else:
     filtered_targets = {}
 
 
+def _tail_lines(text: str, n: int) -> tuple[str, bool]:
+    """Return the last n lines of text. Returns (tail_text, was_truncated)."""
+    if not text:
+        return text, False
+    lines = text.splitlines(keepends=True)
+    if len(lines) <= n:
+        return text, False
+    return "".join(lines[-n:]), True
+
+
 def create_make_tool(target_name: str, description: str):
     """Create an MCP tool for a specific make target."""
 
-    def make_target(
-        additional_args: Optional[str] = None, dry_run: bool = False, max_output_tokens: Optional[int] = None
-    ) -> Dict[str, Any]:
+    def make_target(additional_args: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         """Execute the make target with optional arguments and dry-run capability."""
         try:
             # Build the make command
@@ -240,53 +310,44 @@ def create_make_tool(target_name: str, description: str):
                 timeout=300,  # 5 minute timeout
             )
 
-            # Determine token limit
-            token_limit = max_output_tokens if max_output_tokens is not None else cli_args.max_output_tokens
+            # Cache full output
+            command_str = " ".join(cmd)
+            cached = output_cache.add(
+                target=target_name,
+                command=command_str,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.returncode,
+            )
 
-            # Function to truncate text to approximate token limit
-            def truncate_to_tokens(text: str, max_tokens: int) -> tuple[str, bool]:
-                """Truncate text to approximately max_tokens. Returns (text, was_truncated)."""
-                if not text:
-                    return text, False
+            # Compute line/char stats
+            stdout_lines = result.stdout.splitlines() if result.stdout else []
+            stderr_lines = result.stderr.splitlines() if result.stderr else []
+            tail_n = cli_args.tail_lines
 
-                # Rough approximation: 4 characters per token on average
-                max_chars = max_tokens * 4
-                if len(text) <= max_chars:
-                    return text, False
-
-                # Truncate and add a note
-                truncated_text = text[:max_chars]
-                # Try to break at a line boundary near the end
-                last_newline = truncated_text.rfind("\n", max(0, max_chars - 100))
-                if last_newline > max_chars // 2:  # Only use line break if it's not too early
-                    truncated_text = truncated_text[:last_newline]
-
-                return truncated_text, True
-
-            # Truncate output if needed
-            stdout, stdout_truncated = truncate_to_tokens(result.stdout, token_limit)
-            stderr, stderr_truncated = truncate_to_tokens(result.stderr, token_limit)
+            # Get tail of output
+            stdout_tail, stdout_truncated = _tail_lines(result.stdout, tail_n)
+            stderr_tail, stderr_truncated = _tail_lines(result.stderr, tail_n)
 
             response = {
                 "target": target_name,
-                "command": " ".join(cmd),
+                "command": command_str,
                 "working_directory": str(WORKING_DIR),
                 "exit_code": result.returncode,
-                "stdout": stdout,
-                "stderr": stderr,
+                "execution_id": cached.execution_id,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "stdout_total_lines": len(stdout_lines),
+                "stdout_total_chars": len(result.stdout),
+                "stderr_total_lines": len(stderr_lines),
+                "stderr_total_chars": len(result.stderr),
             }
 
-            # Add truncation notes if applicable
-            if stdout_truncated:
-                response["stdout_truncated"] = True
-                response["stdout_truncation_note"] = (
-                    f"Output truncated to ~{token_limit} tokens. Use max_output_tokens parameter to adjust limit."
-                )
-
-            if stderr_truncated:
-                response["stderr_truncated"] = True
-                response["stderr_truncation_note"] = (
-                    f"Error output truncated to ~{token_limit} tokens. Use max_output_tokens parameter to adjust limit."
+            if stdout_truncated or stderr_truncated:
+                response["truncation_note"] = (
+                    "Output was truncated to the last "
+                    f"{tail_n} lines. Use get_output(execution_id={cached.execution_id}) "
+                    "to paginate or search_output() to search the full output."
                 )
 
             if dry_run:
@@ -341,7 +402,6 @@ for target_name, description in filtered_targets.items():
     created_tools.append((target_name, tool_func))
 
 
-@mcp_server.tool()
 def list_available_targets() -> Dict[str, Any]:
     """
     List all available make targets that can be executed through this server.
@@ -365,7 +425,6 @@ def list_available_targets() -> Dict[str, Any]:
     }
 
 
-@mcp_server.tool()
 def get_makefile_info() -> Dict[str, Any]:
     """
     Get detailed information about the Makefile and its targets.
@@ -394,10 +453,144 @@ def get_makefile_info() -> Dict[str, Any]:
     }
 
 
-if __name__ == "__main__":
+def get_output(execution_id: int, stream: str = "stdout", start_line: int = 0, end_line: int = 100) -> Dict[str, Any]:
+    """
+    Retrieve a page of cached output from a previous make target execution.
+
+    Args:
+        execution_id: The execution ID returned by a make target tool.
+        stream: Which output stream to read — "stdout" or "stderr".
+        start_line: First line to return (0-indexed, inclusive).
+        end_line: Last line to return (exclusive).
+
+    Returns:
+        dict: The requested lines and metadata.
+    """
+    cached = output_cache.get(execution_id)
+    if cached is None:
+        return {
+            "status": "error",
+            "message": f"Execution ID {execution_id} not found in cache.",
+        }
+
+    if stream not in ("stdout", "stderr"):
+        return {
+            "status": "error",
+            "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
+        }
+
+    text = cached.stdout if stream == "stdout" else cached.stderr
+    lines = text.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    # Clamp range
+    start_line = max(0, start_line)
+    end_line = max(start_line, min(end_line, total_lines))
+
+    selected = lines[start_line:end_line]
+
+    return {
+        "status": "success",
+        "execution_id": execution_id,
+        "target": cached.target,
+        "stream": stream,
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": total_lines,
+        "content": "".join(selected),
+    }
+
+
+def search_output(execution_id: int, pattern: str, stream: str = "stdout", context_lines: int = 3) -> Dict[str, Any]:
+    """
+    Search cached output from a previous make target execution.
+
+    Args:
+        execution_id: The execution ID returned by a make target tool.
+        pattern: Substring to search for (case-insensitive).
+        stream: Which output stream to search — "stdout" or "stderr".
+        context_lines: Number of surrounding lines to include with each match.
+
+    Returns:
+        dict: Matching lines with context and line numbers.
+    """
+    cached = output_cache.get(execution_id)
+    if cached is None:
+        return {
+            "status": "error",
+            "message": f"Execution ID {execution_id} not found in cache.",
+        }
+
+    if stream not in ("stdout", "stderr"):
+        return {
+            "status": "error",
+            "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
+        }
+
+    text = cached.stdout if stream == "stdout" else cached.stderr
+    lines = text.splitlines()
+    total_lines = len(lines)
+    pattern_lower = pattern.lower()
+
+    # Find matching line indices
+    match_indices = [i for i, line in enumerate(lines) if pattern_lower in line.lower()]
+
+    # Build matches with context
+    matches: List[Dict[str, Any]] = []
+    for idx in match_indices:
+        ctx_start = max(0, idx - context_lines)
+        ctx_end = min(total_lines, idx + context_lines + 1)
+        context = [{"line_number": i, "text": lines[i], "is_match": i == idx} for i in range(ctx_start, ctx_end)]
+        matches.append(
+            {
+                "line_number": idx,
+                "text": lines[idx],
+                "context": context,
+            }
+        )
+
+    return {
+        "status": "success",
+        "execution_id": execution_id,
+        "target": cached.target,
+        "stream": stream,
+        "pattern": pattern,
+        "total_lines": total_lines,
+        "total_matches": len(matches),
+        "matches": matches,
+    }
+
+
+# Register utility tools with MCP server
+mcp_server.tool()(list_available_targets)
+mcp_server.tool()(get_makefile_info)
+mcp_server.tool()(get_output)
+mcp_server.tool()(search_output)
+
+
+def main():
+    """Entry point for the Makefile MCP server."""
+    global filtered_targets, cli_args, INCLUDE_TARGETS, EXCLUDE_TARGETS, output_cache
+
+    cli_args = initialize_makefile_mcp()
+
+    INCLUDE_TARGETS = None
+    if cli_args.include:
+        INCLUDE_TARGETS = {target.strip() for target in cli_args.include.split(",")}
+    EXCLUDE_TARGETS = set()
+    if cli_args.exclude:
+        EXCLUDE_TARGETS = {target.strip() for target in cli_args.exclude.split(",")}
+
+    output_cache = OutputCache(max_entries=cli_args.max_cached_executions)
+
+    filtered_targets = get_makefile_targets()
+
     if not filtered_targets:
         print("Error: No make targets available to expose as tools", file=sys.stderr)
         sys.exit(1)
+
+    for target_name, description in filtered_targets.items():
+        create_make_tool(target_name, description)
 
     print("Starting Makefile MCP server")
     print(f"  Makefile: {MAKEFILE_PATH}")
@@ -410,3 +603,7 @@ if __name__ == "__main__":
         print(f"  Exclude filter: {', '.join(EXCLUDE_TARGETS)}")
 
     mcp_server.run()
+
+
+if __name__ == "__main__":
+    main()

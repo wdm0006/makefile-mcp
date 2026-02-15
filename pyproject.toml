@@ -21,7 +21,11 @@ dependencies = [
 dev = [
     "ruff",
     "pytest",
+    "pre-commit",
 ]
+
+[project.scripts]
+makefile-mcp = "makefile_mcp:main"
 
 [project.urls]
 "Homepage" = "https://github.com/wdm0006/makefile-mcp"
@@ -29,6 +33,8 @@ dev = [
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
 select = ["E", "W", "F", "I", "C", "B"]
 ignore = ["E501", "C901"]
 

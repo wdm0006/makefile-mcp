@@ -379,6 +379,40 @@ clean:
             assert "failed with exit code 2" in result["message"]
 
     @patch("subprocess.run")
+    def test_make_tool_uses_custom_makefile(self, mock_run, tmp_path):
+        """Test execution explicitly uses a custom makefile path."""
+        custom_makefile = tmp_path / "custom.mk"
+        custom_makefile.write_text("custom:\n\techo custom\n")
+        working_dir = tmp_path / "work"
+        working_dir.mkdir()
+        (working_dir / "Makefile").write_text("default:\n\techo default\n")
+
+        mock_result = MagicMock(returncode=0, stdout="custom\n", stderr="")
+        mock_run.return_value = mock_result
+
+        with patch(
+            "sys.argv",
+            [
+                "makefile_mcp.py",
+                "--makefile",
+                str(custom_makefile),
+                "--working-dir",
+                str(working_dir),
+            ],
+        ):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("custom", "Run custom target")
+            result = make_tool()
+
+        expected_command = ["make", "-C", str(working_dir), "-f", str(custom_makefile), "custom"]
+        mock_run.assert_called_once_with(expected_command, capture_output=True, text=True, timeout=300)
+        assert result["command"] == " ".join(expected_command)
+
+    @patch("subprocess.run")
     def test_make_tool_dry_run(self, mock_run, test_makefile):
         """Test dry run execution of a make target."""
         mock_result = MagicMock()

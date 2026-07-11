@@ -293,7 +293,7 @@ def create_make_tool(target_name: str, description: str):
         """Execute the make target with optional arguments and dry-run capability."""
         try:
             # Build the make command
-            cmd = ["make", "-C", str(WORKING_DIR), target_name]
+            cmd = ["make", "-C", str(WORKING_DIR), "-f", str(MAKEFILE_PATH), target_name]
 
             if dry_run:
                 cmd.append("-n")  # Dry run flag for make
@@ -387,7 +387,7 @@ def create_make_tool(target_name: str, description: str):
     # Set the function name and docstring dynamically
     tool_name = f"make_{target_name.replace('-', '_').replace('.', '_')}"
     make_target.__name__ = tool_name
-    make_target.__doc__ = f"{description}.\n\nExecutes: make -C {WORKING_DIR} {target_name}"
+    make_target.__doc__ = f"{description}.\n\nExecutes: make -C {WORKING_DIR} -f {MAKEFILE_PATH} {target_name}"
 
     # Register the tool with the MCP server
     mcp_server.tool()(make_target)

@@ -131,6 +131,46 @@ clean:
         finally:
             os.unlink(makefile_path)
 
+    def test_variable_assignments_not_targets(self):
+        """Simply-expanded (:=) and ::= variable assignments must not be parsed as targets."""
+        from makefile_mcp import MakefileParser
+
+        makefile_content = """CC := gcc
+PREFIX := /usr/local
+OBJS ::= a.o b.o
+VERSION ?= 1.0
+CFLAGS = -O2
+
+build: deps
+\t$(CC) -o app
+
+deps:
+\techo "deps"
+"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
+            f.write(makefile_content)
+            makefile_path = f.name
+
+        try:
+            parser = MakefileParser(pathlib.Path(makefile_path))
+            targets = parser.get_targets()
+
+            # Variable assignments should never become targets
+            assert "CC" not in targets
+            assert "PREFIX" not in targets
+            assert "OBJS" not in targets
+            assert "VERSION" not in targets
+            assert "CFLAGS" not in targets
+
+            # Real targets are still discovered
+            assert "build" in targets
+            assert "deps" in targets
+            assert len(targets) == 2
+
+        finally:
+            os.unlink(makefile_path)
+
     def test_filtering_targets(self):
         """Test include/exclude filtering of targets."""
         from makefile_mcp import MakefileParser

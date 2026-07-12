@@ -212,7 +212,7 @@ class MakefileParser:
                 continue
 
             # Look for target definitions (target: dependencies)
-            target_match = re.match(r"^([a-zA-Z0-9_.-]+)\s*:", line)
+            target_match = re.match(r"^([a-zA-Z0-9_.-]+)\s*:(?![:=])", line)
             if target_match:
                 target_name = target_match.group(1)
 

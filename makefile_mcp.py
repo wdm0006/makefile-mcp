@@ -286,6 +286,23 @@ def _tail_lines(text: str, n: int) -> tuple[str, bool]:
     return "".join(lines[-n:]), True
 
 
+def make_tool_name(target_name: str) -> str:
+    """Return the MCP tool name for a make target."""
+    return f"make_{target_name.replace('-', '_').replace('.', '_')}"
+
+
+def validate_tool_names(targets: Dict[str, str]) -> None:
+    """Reject targets that would generate duplicate MCP tool names."""
+    targets_by_tool_name: Dict[str, List[str]] = {}
+    for target_name in targets:
+        targets_by_tool_name.setdefault(make_tool_name(target_name), []).append(target_name)
+
+    collisions = {name: names for name, names in targets_by_tool_name.items() if len(names) > 1}
+    if collisions:
+        details = "; ".join(f"{tool_name}: {', '.join(target_names)}" for tool_name, target_names in collisions.items())
+        raise ValueError(f"Conflicting make targets generate the same MCP tool name: {details}")
+
+
 def create_make_tool(target_name: str, description: str):
     """Create an MCP tool for a specific make target."""
 
@@ -385,7 +402,7 @@ def create_make_tool(target_name: str, description: str):
             }
 
     # Set the function name and docstring dynamically
-    tool_name = f"make_{target_name.replace('-', '_').replace('.', '_')}"
+    tool_name = make_tool_name(target_name)
     make_target.__name__ = tool_name
     make_target.__doc__ = f"{description}.\n\nExecutes: make -C {WORKING_DIR} -f {MAKEFILE_PATH} {target_name}"
 
@@ -395,11 +412,18 @@ def create_make_tool(target_name: str, description: str):
     return make_target
 
 
+def register_make_tools(targets: Dict[str, str]):
+    """Validate and register MCP tools for make targets."""
+    validate_tool_names(targets)
+    return [(target_name, create_make_tool(target_name, description)) for target_name, description in targets.items()]
+
+
 # Create tools for each filtered target
-created_tools = []
-for target_name, description in filtered_targets.items():
-    tool_func = create_make_tool(target_name, description)
-    created_tools.append((target_name, tool_func))
+try:
+    created_tools = register_make_tools(filtered_targets)
+except ValueError as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
 
 
 def list_available_targets() -> Dict[str, Any]:
@@ -417,7 +441,7 @@ def list_available_targets() -> Dict[str, Any]:
         ),
         "available_targets": len(filtered_targets),
         "targets": [
-            {"name": name, "description": desc, "tool_name": f"make_{name.replace('-', '_').replace('.', '_')}"}
+            {"name": name, "description": desc, "tool_name": make_tool_name(name)}
             for name, desc in filtered_targets.items()
         ],
         "include_filter": list(INCLUDE_TARGETS) if INCLUDE_TARGETS else None,
@@ -589,8 +613,11 @@ def main():
         print("Error: No make targets available to expose as tools", file=sys.stderr)
         sys.exit(1)
 
-    for target_name, description in filtered_targets.items():
-        create_make_tool(target_name, description)
+    try:
+        register_make_tools(filtered_targets)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print("Starting Makefile MCP server")
     print(f"  Makefile: {MAKEFILE_PATH}")

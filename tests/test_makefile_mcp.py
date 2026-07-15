@@ -357,6 +357,43 @@ clean:
             assert "test" in makefile_mcp.filtered_targets
             assert "clean" in makefile_mcp.filtered_targets
 
+    def test_startup_rejects_colliding_tool_names(self, tmp_path, capsys):
+        """Startup rejects targets that normalize to the same tool name."""
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text("foo-bar:\n\techo hyphen\n\nfoo.bar:\n\techo period\n")
+
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", str(makefile_path)]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            with patch.object(makefile_mcp, "create_make_tool") as create_make_tool:
+                with pytest.raises(SystemExit) as exc_info:
+                    makefile_mcp.main()
+
+        assert exc_info.value.code == 1
+        create_make_tool.assert_not_called()
+        error = capsys.readouterr().err
+        assert "make_foo_bar" in error
+        assert "foo-bar" in error
+        assert "foo.bar" in error
+
+    def test_tool_name_normalization_is_shared(self, test_makefile):
+        """Registration and target metadata use the same name generator."""
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            makefile_mcp.filtered_targets = {"test-coverage.xml": "Coverage"}
+            tool = makefile_mcp.create_make_tool("test-coverage.xml", "Coverage")
+            listed_target = makefile_mcp.list_available_targets()["targets"][0]
+
+        assert tool.__name__ == "make_test_coverage_xml"
+        assert listed_target["tool_name"] == tool.__name__
+
     @patch("subprocess.run")
     def test_make_tool_execution_success(self, mock_run, test_makefile):
         """Test successful execution of a make target."""

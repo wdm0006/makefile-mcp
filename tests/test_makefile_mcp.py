@@ -498,8 +498,44 @@ clean:
             assert result["status"] == "success"
 
             call_args = mock_run.call_args[0][0]
-            assert "-j4" in call_args
-            assert "VERBOSE=1" in call_args
+            assert call_args[-2:] == ["-j4", "VERBOSE=1"]
+
+    @patch("subprocess.run")
+    def test_make_tool_additional_args_preserve_quoting(self, mock_run, test_makefile):
+        """Quoted values and escaped spaces stay a single argument."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("test", "Run tests")
+            result = make_tool(additional_args='MESSAGE="hello world" PATH_ARG=my\\ file.txt -j4')
+
+            assert result["status"] == "success"
+
+            call_args = mock_run.call_args[0][0]
+            assert call_args[-3:] == ["MESSAGE=hello world", "PATH_ARG=my file.txt", "-j4"]
+
+    @patch("subprocess.run")
+    def test_make_tool_invalid_additional_args(self, mock_run, test_makefile):
+        """Malformed quoting is reported as an error without invoking make."""
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("test", "Run tests")
+            result = make_tool(additional_args='MESSAGE="unclosed')
+
+            assert result["status"] == "error"
+            assert result["target"] == "test"
+            assert result["exit_code"] == -1
+            assert "Invalid additional_args" in result["message"]
+            mock_run.assert_not_called()
 
     def test_list_available_targets_tool(self, test_makefile):
         """Test the list_available_targets tool."""

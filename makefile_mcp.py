@@ -18,6 +18,7 @@ import argparse
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -308,6 +309,18 @@ def create_make_tool(target_name: str, description: str):
 
     def make_target(additional_args: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         """Execute the make target with optional arguments and dry-run capability."""
+        extra_args: List[str] = []
+        if additional_args:
+            try:
+                extra_args = shlex.split(additional_args)
+            except ValueError as e:
+                return {
+                    "target": target_name,
+                    "status": "error",
+                    "message": f"Invalid additional_args for target '{target_name}': {str(e)}",
+                    "exit_code": -1,
+                }
+
         try:
             # Build the make command
             cmd = ["make", "-C", str(WORKING_DIR), "-f", str(MAKEFILE_PATH), target_name]
@@ -315,9 +328,7 @@ def create_make_tool(target_name: str, description: str):
             if dry_run:
                 cmd.append("-n")  # Dry run flag for make
 
-            if additional_args:
-                # Split additional args and add them
-                cmd.extend(additional_args.split())
+            cmd.extend(extra_args)
 
             # Execute the command - safe execution with list of args, no shell injection risk
             result = subprocess.run(  # noqa: S603

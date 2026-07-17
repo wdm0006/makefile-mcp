@@ -305,6 +305,76 @@ deploy: build
         finally:
             os.unlink(makefile_path)
 
+    def test_multi_target_rule(self):
+        """Rules declaring several targets on one line expose each as a target."""
+        from makefile_mcp import MakefileParser
+
+        makefile_content = """# Control the service
+start stop restart:
+\t@echo "$@"
+
+install uninstall: build
+\t@echo "$@"
+"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
+            f.write(makefile_content)
+            makefile_path = f.name
+
+        try:
+            parser = MakefileParser(pathlib.Path(makefile_path))
+            targets = parser.get_targets()
+
+            # Every target on a multi-target rule is discovered.
+            for name in ("start", "stop", "restart", "install", "uninstall"):
+                assert name in targets
+
+            # The preceding comment applies to each target on that rule.
+            assert targets["start"] == "Control the service"
+            assert targets["stop"] == "Control the service"
+            assert targets["restart"] == "Control the service"
+
+            # A rule with no preceding comment gets a per-target default.
+            assert targets["install"] == "Execute the 'install' target"
+            assert targets["uninstall"] == "Execute the 'uninstall' target"
+
+        finally:
+            os.unlink(makefile_path)
+
+    def test_multi_target_rule_excludes_special_and_pattern(self):
+        """Special targets on a multi-target rule are skipped while siblings are kept."""
+        from makefile_mcp import MakefileParser
+
+        makefile_content = """.hidden start:
+\t@echo "$@"
+
+%.o: %.c
+\tgcc -c $< -o $@
+
+CONFIG := build
+"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
+            f.write(makefile_content)
+            makefile_path = f.name
+
+        try:
+            parser = MakefileParser(pathlib.Path(makefile_path))
+            targets = parser.get_targets()
+
+            # A dot-prefixed sibling on a multi-target rule is excluded; the
+            # ordinary sibling is still discovered.
+            assert "start" in targets
+            assert ".hidden" not in targets
+
+            # Pattern rules and variable assignments remain excluded.
+            assert "%.o" not in targets
+            assert "CONFIG" not in targets
+            assert len(targets) == 1
+
+        finally:
+            os.unlink(makefile_path)
+
 
 class TestMakefileMCPServer:
     """Test the MCP server functionality."""

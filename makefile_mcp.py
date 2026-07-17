@@ -83,6 +83,14 @@ MAKEFILE_PATH = None
 WORKING_DIR = None
 
 
+def positive_int(value: str) -> int:
+    """Parse a strictly positive integer for CLI limits."""
+    parsed_value = int(value)
+    if parsed_value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed_value
+
+
 def parse_cli_args():
     """
     Parse command-line arguments for Makefile configuration.
@@ -100,13 +108,13 @@ def parse_cli_args():
     )
     parser.add_argument(
         "--max-cached-executions",
-        type=int,
+        type=positive_int,
         default=20,
         help="Maximum number of cached execution outputs to keep (default: 20)",
     )
     parser.add_argument(
         "--tail-lines",
-        type=int,
+        type=positive_int,
         default=50,
         help="Number of tail lines to include in make tool responses (default: 50)",
     )

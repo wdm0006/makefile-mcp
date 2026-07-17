@@ -688,6 +688,40 @@ class TestCommandLineArguments:
 
             assert args.working_dir == "/custom/work/dir"
 
+    @pytest.mark.parametrize("option", ["--max-cached-executions", "--tail-lines"])
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_output_limits_must_be_positive(self, option, value, capsys):
+        """Test output limits reject zero and negative values."""
+        with patch("sys.argv", ["makefile_mcp.py"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            from makefile_mcp import parse_cli_args
+
+        with patch("sys.argv", ["makefile_mcp.py", option, value]):
+            with pytest.raises(SystemExit) as exc_info:
+                parse_cli_args()
+
+        assert exc_info.value.code == 2
+        error = capsys.readouterr().err
+        assert f"argument {option}" in error
+        assert "must be a positive integer" in error
+
+    def test_positive_output_limits_are_accepted(self):
+        """Test positive custom output limits are preserved."""
+        test_args = ["makefile_mcp.py", "--max-cached-executions", "3", "--tail-lines", "5"]
+
+        with patch("sys.argv", test_args):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            from makefile_mcp import parse_cli_args
+
+            args = parse_cli_args()
+
+        assert args.max_cached_executions == 3
+        assert args.tail_lines == 5
+
 
 class TestErrorHandling:
     """Test error handling scenarios."""

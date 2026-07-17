@@ -220,23 +220,24 @@ class MakefileParser:
                 current_comment = ""
                 continue
 
-            # Look for target definitions (target: dependencies)
-            target_match = re.match(r"^([a-zA-Z0-9_.-]+)\s*:(?![:=])", line)
+            # Look for target definitions (target: dependencies). A single rule
+            # may declare several space-separated targets, e.g. "start stop restart:".
+            target_match = re.match(r"^([a-zA-Z0-9_.-][a-zA-Z0-9_.\- ]*?)\s*:(?![:=])", line)
             if target_match:
-                target_name = target_match.group(1)
+                for target_name in target_match.group(1).split():
+                    # Skip special targets that start with . or contain %
+                    if target_name.startswith(".") or "%" in target_name:
+                        continue
 
-                # Skip special targets that start with . or contain %
-                if target_name.startswith(".") or "%" in target_name:
-                    current_comment = ""
-                    continue
+                    # Apply the preceding comment to every target on the rule,
+                    # or generate a default description per target.
+                    if current_comment:
+                        description = current_comment
+                    else:
+                        description = f"Execute the '{target_name}' target"
 
-                # Use the comment as description, or generate a default one
-                if current_comment:
-                    description = current_comment
-                else:
-                    description = f"Execute the '{target_name}' target"
+                    self.targets[target_name] = description
 
-                self.targets[target_name] = description
                 current_comment = ""
                 continue
 

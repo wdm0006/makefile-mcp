@@ -449,6 +449,40 @@ clean:
         assert "foo-bar" in error
         assert "foo.bar" in error
 
+    def test_startup_status_uses_stderr(self, tmp_path, capsys):
+        """Startup keeps stdout clean for the MCP stdio transport."""
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text("build:\n\techo build\n\ntest:\n\techo test\n")
+
+        argv = [
+            "makefile_mcp.py",
+            "--makefile",
+            str(makefile_path),
+            "--include",
+            "build,test",
+            "--exclude",
+            "test",
+        ]
+        with patch("sys.argv", argv):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            with patch.object(makefile_mcp.mcp_server, "run") as run:
+                makefile_mcp.main()
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Starting Makefile MCP server" in captured.err
+        assert f"Makefile: {makefile_path.resolve()}" in captured.err
+        assert f"Working directory: {tmp_path.resolve()}" in captured.err
+        assert "Available targets: build" in captured.err
+        include_line = next(line for line in captured.err.splitlines() if "Include filter:" in line)
+        assert {target.strip() for target in include_line.split(":", 1)[1].split(",")} == {"build", "test"}
+        assert "Exclude filter: test" in captured.err
+        run.assert_called_once_with()
+
     def test_tool_name_normalization_is_shared(self, test_makefile):
         """Registration and target metadata use the same name generator."""
         with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):

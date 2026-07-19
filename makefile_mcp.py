@@ -639,15 +639,15 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print("Starting Makefile MCP server")
-    print(f"  Makefile: {MAKEFILE_PATH}")
-    print(f"  Working directory: {WORKING_DIR}")
-    print(f"  Available targets: {', '.join(filtered_targets.keys())}")
+    print("Starting Makefile MCP server", file=sys.stderr)
+    print(f"  Makefile: {MAKEFILE_PATH}", file=sys.stderr)
+    print(f"  Working directory: {WORKING_DIR}", file=sys.stderr)
+    print(f"  Available targets: {', '.join(filtered_targets.keys())}", file=sys.stderr)
 
     if INCLUDE_TARGETS:
-        print(f"  Include filter: {', '.join(INCLUDE_TARGETS)}")
+        print(f"  Include filter: {', '.join(INCLUDE_TARGETS)}", file=sys.stderr)
     if EXCLUDE_TARGETS:
-        print(f"  Exclude filter: {', '.join(EXCLUDE_TARGETS)}")
+        print(f"  Exclude filter: {', '.join(EXCLUDE_TARGETS)}", file=sys.stderr)
 
     mcp_server.run()
 

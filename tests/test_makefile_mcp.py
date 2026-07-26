@@ -678,6 +678,78 @@ clean:
             assert "Invalid additional_args" in result["message"]
             mock_run.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "additional_args",
+        [
+            "blocked",  # bare secondary target
+            "-f /path/to/other.mk other",  # short attached makefile + target
+            "-f/path/to/other.mk",  # short attached makefile
+            "--file=other.mk",  # long makefile with value
+            "--makefile other.mk",  # long makefile, separated value
+            "-C /tmp",  # short change-directory
+            "--directory=/tmp",  # long change-directory
+            "-I /some/include/dir",  # include-dir loads makefiles
+            "--include-dir=/some/dir",
+            "--eval=$(shell touch pwned)",  # evaluate makefile syntax
+            "-j4 sneaky",  # safe flag but trailing bare target
+            "VAR=1 anothertarget",  # assignment followed by a target
+            "--",  # end-of-options marker
+            "-- target",
+        ],
+    )
+    @patch("subprocess.run")
+    def test_make_tool_rejects_boundary_bypass_args(self, mock_run, additional_args, test_makefile):
+        """Target/makefile/directory/eval bypass attempts never reach subprocess.run."""
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
+            result = make_tool(additional_args=additional_args)
+
+            assert result["status"] == "error"
+            assert result["target"] == "safe"
+            assert result["exit_code"] == -1
+            assert "Rejected additional_args" in result["message"]
+            mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("additional_args", "expected_tail"),
+        [
+            ("-j4 VERBOSE=1", ["-j4", "VERBOSE=1"]),
+            ("-j 4", ["-j", "4"]),
+            ("--jobs=4", ["--jobs=4"]),
+            ("--jobs 4", ["--jobs", "4"]),
+            ("-k -s", ["-k", "-s"]),
+            ("-ks", ["-ks"]),
+            ('MESSAGE="hello world"', ["MESSAGE=hello world"]),
+            ("PATH_ARG=my\\ file.txt", ["PATH_ARG=my file.txt"]),
+            ("NAME:=value", ["NAME:=value"]),
+            ("--keep-going", ["--keep-going"]),
+            ("--load-average 2.5", ["--load-average", "2.5"]),
+        ],
+    )
+    @patch("subprocess.run")
+    def test_make_tool_accepts_safe_args(self, mock_run, additional_args, expected_tail, test_makefile):
+        """Safe execution flags and variable assignments still reach make unchanged."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
+            result = make_tool(additional_args=additional_args)
+
+            assert result["status"] == "success"
+
+            call_args = mock_run.call_args[0][0]
+            assert call_args[-len(expected_tail) :] == expected_tail
+
     def test_list_available_targets_tool(self, test_makefile):
         """Test the list_available_targets tool."""
         with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):

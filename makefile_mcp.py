@@ -313,6 +313,111 @@ def validate_tool_names(targets: Dict[str, str]) -> None:
         raise ValueError(f"Conflicting make targets generate the same MCP tool name: {details}")
 
 
+# A command-line make variable assignment: NAME=value, NAME:=value, NAME::=value,
+# NAME+=value, NAME?=value, NAME!=value. These override variables and cannot select
+# another target, load another makefile, or change directory.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*(?:::|:|\+|\?|!)?=")
+
+# Short option letters that only tune execution and cannot select another target,
+# load/evaluate another makefile, or change directory. Dangerous letters are absent
+# on purpose (e.g. -f/--file, -C/--directory, -I/--include-dir, -o, -W).
+_ALLOWED_SHORT_FLAGS = set("BdeijklnOqRrsw")
+# Short flags whose value may be attached (-j4) or separated (-j 4).
+_SHORT_FLAGS_WITH_VALUE = set("jl")
+# Short flags whose value is optional and only ever attached (-Oline).
+_SHORT_FLAGS_OPTIONAL_VALUE = set("O")
+
+# Long options that take no value.
+_ALLOWED_LONG_FLAGS_NO_VALUE = {
+    "keep-going",
+    "silent",
+    "quiet",
+    "ignore-errors",
+    "dry-run",
+    "just-print",
+    "recon",
+    "print-directory",
+    "no-print-directory",
+    "always-make",
+    "no-builtin-rules",
+    "no-builtin-variables",
+    "environment-overrides",
+    "question",
+    "trace",
+    "warn-undefined-variables",
+}
+# Long options that require a value, attached (--jobs=4) or separated (--jobs 4).
+_ALLOWED_LONG_FLAGS_WITH_VALUE = {
+    "jobs",
+    "load-average",
+    "max-load",
+}
+# Long options whose value is optional and only ever attached (--debug=b).
+_ALLOWED_LONG_FLAGS_OPTIONAL_VALUE = {
+    "output-sync",
+    "debug",
+}
+
+
+def validate_additional_args(tokens: List[str]) -> Optional[str]:
+    """Return an error message if any token falls outside the safe allowlist.
+
+    Accepts make variable assignments and an explicit set of execution-tuning
+    options. Rejects bare targets, end-of-options markers, and any option that
+    could select another target, load/evaluate another makefile, or change
+    directory. Returns None when every token is allowed.
+    """
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+
+        if tok == "--":
+            return "'--' is not allowed; following tokens would be treated as targets"
+
+        if not tok.startswith("-"):
+            if _ASSIGNMENT_RE.match(tok):
+                i += 1
+                continue
+            return f"'{tok}' is not an allowed variable assignment or option (it would select another target)"
+
+        if tok.startswith("--"):
+            name, sep, _value = tok[2:].partition("=")
+            if name in _ALLOWED_LONG_FLAGS_NO_VALUE:
+                if sep:
+                    return f"option '--{name}' does not take a value"
+                i += 1
+                continue
+            if name in _ALLOWED_LONG_FLAGS_OPTIONAL_VALUE:
+                i += 1
+                continue
+            if name in _ALLOWED_LONG_FLAGS_WITH_VALUE:
+                i += 1 if sep else 2  # consume a separated value token
+                continue
+            return f"option '--{name}' is not in the allowed make option set"
+
+        # Short option cluster: -j4, -ks, -j 4
+        body = tok[1:]
+        if not body:
+            return "'-' is not an allowed option"
+        consumed_separated = False
+        j = 0
+        while j < len(body):
+            ch = body[j]
+            if ch not in _ALLOWED_SHORT_FLAGS:
+                return f"option '-{ch}' is not in the allowed make option set"
+            if ch in _SHORT_FLAGS_WITH_VALUE:
+                if not body[j + 1 :]:  # value is the next token
+                    consumed_separated = True
+                break  # remainder of the cluster is this flag's value
+            if ch in _SHORT_FLAGS_OPTIONAL_VALUE:
+                break  # remainder, if any, is an attached optional value
+            j += 1
+        i += 2 if consumed_separated else 1
+
+    return None
+
+
 def create_make_tool(target_name: str, description: str):
     """Create an MCP tool for a specific make target."""
 
@@ -327,6 +432,15 @@ def create_make_tool(target_name: str, description: str):
                     "target": target_name,
                     "status": "error",
                     "message": f"Invalid additional_args for target '{target_name}': {str(e)}",
+                    "exit_code": -1,
+                }
+
+            arg_error = validate_additional_args(extra_args)
+            if arg_error is not None:
+                return {
+                    "target": target_name,
+                    "status": "error",
+                    "message": f"Rejected additional_args for target '{target_name}': {arg_error}",
                     "exit_code": -1,
                 }
 

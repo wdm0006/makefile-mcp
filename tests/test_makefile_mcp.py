@@ -956,6 +956,137 @@ class TestErrorHandling:
             os.unlink(makefile_path)
 
 
+class TestTimeoutPartialOutput:
+    """Test that partial output captured before a timeout is preserved."""
+
+    def _run_timed_out_target(self, tmp_path, timeout_error, extra_argv=()):
+        """Import a fresh module, run a target that times out, return (module, result)."""
+        makefile = tmp_path / "Makefile"
+        makefile.write_text("slow:\n\tsleep 600\n")
+
+        argv = ["makefile_mcp.py", "--makefile", str(makefile), *extra_argv]
+        with patch("subprocess.run", side_effect=timeout_error), patch("sys.argv", argv):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("slow", "Slow target")
+            return makefile_mcp, make_tool()
+
+    def test_bytes_partial_output_is_cached(self, tmp_path):
+        """Byte-valued captured output (what POSIX actually reports) is decoded and cached."""
+        error = subprocess.TimeoutExpired(
+            "make",
+            300,
+            output=b"compiling\nlinking\n",
+            stderr=b"ld: undefined symbol _main\n",
+        )
+        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+
+        assert result["status"] == "error"
+        assert "timed out" in result["message"]
+        assert result["exit_code"] == -1
+        assert result["execution_id"] == 1
+        assert result["stdout_tail"] == "compiling\nlinking\n"
+        assert result["stderr_tail"] == "ld: undefined symbol _main\n"
+        assert result["stdout_total_lines"] == 2
+        assert result["stdout_total_chars"] == len("compiling\nlinking\n")
+        assert result["stderr_total_lines"] == 1
+        assert result["stderr_total_chars"] == len("ld: undefined symbol _main\n")
+
+        cached = makefile_mcp.output_cache.get(result["execution_id"])
+        assert cached.stdout == "compiling\nlinking\n"
+        assert cached.stderr == "ld: undefined symbol _main\n"
+        assert cached.exit_code == -1
+        assert cached.target == "slow"
+
+    def test_str_partial_output_is_cached(self, tmp_path):
+        """Already-decoded captured output is preserved without a secondary exception."""
+        error = subprocess.TimeoutExpired("make", 300, output="running tests\n", stderr="warning: slow\n")
+        _makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+
+        assert result["stdout_tail"] == "running tests\n"
+        assert result["stderr_tail"] == "warning: slow\n"
+        assert result["stdout_total_lines"] == 1
+        assert result["stderr_total_lines"] == 1
+
+    def test_undecodable_bytes_do_not_raise(self, tmp_path):
+        """Invalid UTF-8 in the partial stream is replaced rather than raising."""
+        error = subprocess.TimeoutExpired("make", 300, output=b"ok\n\xff\n", stderr=None)
+        _makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+
+        assert result["exit_code"] == -1
+        assert result["stdout_total_lines"] == 2
+        assert "�" in result["stdout_tail"]
+
+    def test_partial_output_is_retrievable_by_execution_id(self, tmp_path):
+        """get_output and search_output can read the cached partial streams."""
+        stdout = "".join(f"step {i}\n" for i in range(10)) + "FATAL: disk full\n"
+        error = subprocess.TimeoutExpired("make", 300, output=stdout.encode(), stderr=b"make: *** [slow] Error 1\n")
+        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        eid = result["execution_id"]
+
+        paged = makefile_mcp.get_output(eid, stream="stdout", start_line=0, end_line=3)
+        assert paged["status"] == "success"
+        assert paged["total_lines"] == 11
+        assert paged["content"].splitlines() == ["step 0", "step 1", "step 2"]
+
+        stderr_page = makefile_mcp.get_output(eid, stream="stderr", start_line=0, end_line=100)
+        assert stderr_page["content"].strip() == "make: *** [slow] Error 1"
+
+        found = makefile_mcp.search_output(eid, "FATAL")
+        assert found["total_matches"] == 1
+        assert found["matches"][0]["line_number"] == 10
+        assert found["matches"][0]["text"] == "FATAL: disk full"
+
+    def test_partial_output_is_tail_bounded(self, tmp_path):
+        """Long partial output is truncated inline and points at the log tools."""
+        stdout = "".join(f"line{i}\n" for i in range(100))
+        error = subprocess.TimeoutExpired("make", 300, output=stdout.encode(), stderr=b"")
+        makefile_mcp, result = self._run_timed_out_target(tmp_path, error, extra_argv=["--tail-lines", "5"])
+
+        assert result["stdout_tail"].splitlines() == ["line95", "line96", "line97", "line98", "line99"]
+        assert result["stdout_total_lines"] == 100
+        assert "truncation_note" in result
+        assert f"get_output(execution_id={result['execution_id']})" in result["truncation_note"]
+
+        full = makefile_mcp.get_output(result["execution_id"], stream="stdout", start_line=0, end_line=1000)
+        assert full["total_lines"] == 100
+
+    def test_empty_partial_output_has_zero_metadata(self, tmp_path):
+        """A timeout with nothing captured still reports a clear error and zero-valued totals."""
+        error = subprocess.TimeoutExpired("make", 300)
+        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+
+        assert result["status"] == "error"
+        assert "timed out" in result["message"]
+        assert result["exit_code"] == -1
+        assert result["stdout_tail"] == ""
+        assert result["stderr_tail"] == ""
+        assert result["stdout_total_lines"] == 0
+        assert result["stdout_total_chars"] == 0
+        assert result["stderr_total_lines"] == 0
+        assert result["stderr_total_chars"] == 0
+        assert "truncation_note" not in result
+
+        cached = makefile_mcp.output_cache.get(result["execution_id"])
+        assert cached.stdout == ""
+        assert cached.stderr == ""
+
+    def test_timeout_response_reports_command_context(self, tmp_path):
+        """The timeout response carries the same command context as a completed run."""
+        error = subprocess.TimeoutExpired("make", 300, output=b"partial\n")
+        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+
+        expected_command = " ".join(
+            ["make", "-C", str(makefile_mcp.WORKING_DIR), "-f", str(makefile_mcp.MAKEFILE_PATH), "slow"]
+        )
+        assert result["command"] == expected_command
+        assert result["working_directory"] == str(makefile_mcp.WORKING_DIR)
+        assert makefile_mcp.output_cache.get(result["execution_id"]).command == expected_command
+
+
 class TestOutputCache:
     """Test the OutputCache class."""
 

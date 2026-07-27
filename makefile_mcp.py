@@ -296,6 +296,44 @@ def _tail_lines(text: str, n: int) -> tuple[str, bool]:
     return "".join(lines[-n:]), True
 
 
+def _bounded_output_fields(stdout: str, stderr: str, tail_n: int, execution_id: int) -> Dict[str, Any]:
+    """Build the bounded output fields shared by completed and timed-out executions."""
+    stdout_tail, stdout_truncated = _tail_lines(stdout, tail_n)
+    stderr_tail, stderr_truncated = _tail_lines(stderr, tail_n)
+
+    fields: Dict[str, Any] = {
+        "execution_id": execution_id,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "stdout_total_lines": len(stdout.splitlines()),
+        "stdout_total_chars": len(stdout),
+        "stderr_total_lines": len(stderr.splitlines()),
+        "stderr_total_chars": len(stderr),
+    }
+
+    if stdout_truncated or stderr_truncated:
+        fields["truncation_note"] = (
+            "Output was truncated to the last "
+            f"{tail_n} lines. Use get_output(execution_id={execution_id}) "
+            "to paginate or search_output() to search the full output."
+        )
+
+    return fields
+
+
+def _as_text(stream: Any) -> str:
+    """Normalize a captured subprocess stream to text.
+
+    subprocess.TimeoutExpired carries the raw bytes read before the timeout even
+    when the call used text=True, and either stream may be absent entirely.
+    """
+    if stream is None:
+        return ""
+    if isinstance(stream, (bytes, bytearray)):
+        return bytes(stream).decode("utf-8", errors="replace")
+    return str(stream)
+
+
 def make_tool_name(target_name: str) -> str:
     """Return the MCP tool name for a make target."""
     return f"make_{target_name.replace('-', '_').replace('.', '_')}"
@@ -471,35 +509,13 @@ def create_make_tool(target_name: str, description: str):
                 exit_code=result.returncode,
             )
 
-            # Compute line/char stats
-            stdout_lines = result.stdout.splitlines() if result.stdout else []
-            stderr_lines = result.stderr.splitlines() if result.stderr else []
-            tail_n = cli_args.tail_lines
-
-            # Get tail of output
-            stdout_tail, stdout_truncated = _tail_lines(result.stdout, tail_n)
-            stderr_tail, stderr_truncated = _tail_lines(result.stderr, tail_n)
-
             response = {
                 "target": target_name,
                 "command": command_str,
                 "working_directory": str(WORKING_DIR),
                 "exit_code": result.returncode,
-                "execution_id": cached.execution_id,
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-                "stdout_total_lines": len(stdout_lines),
-                "stdout_total_chars": len(result.stdout),
-                "stderr_total_lines": len(stderr_lines),
-                "stderr_total_chars": len(result.stderr),
+                **_bounded_output_fields(result.stdout, result.stderr, cli_args.tail_lines, cached.execution_id),
             }
-
-            if stdout_truncated or stderr_truncated:
-                response["truncation_note"] = (
-                    "Output was truncated to the last "
-                    f"{tail_n} lines. Use get_output(execution_id={cached.execution_id}) "
-                    "to paginate or search_output() to search the full output."
-                )
 
             if dry_run:
                 response["note"] = "This was a dry run - no commands were actually executed"
@@ -513,12 +529,28 @@ def create_make_tool(target_name: str, description: str):
 
             return response
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            # The killed process may still have printed the decisive diagnostic, so
+            # cache whatever was captured and expose it like a completed execution.
+            partial_stdout = _as_text(e.stdout)
+            partial_stderr = _as_text(e.stderr)
+            command_str = " ".join(cmd)
+            cached = output_cache.add(
+                target=target_name,
+                command=command_str,
+                stdout=partial_stdout,
+                stderr=partial_stderr,
+                exit_code=-1,
+            )
+
             return {
                 "target": target_name,
+                "command": command_str,
+                "working_directory": str(WORKING_DIR),
                 "status": "error",
                 "message": f"Target '{target_name}' timed out after 5 minutes",
                 "exit_code": -1,
+                **_bounded_output_fields(partial_stdout, partial_stderr, cli_args.tail_lines, cached.execution_id),
             }
         except subprocess.SubprocessError as e:
             return {

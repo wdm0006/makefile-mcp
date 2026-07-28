@@ -91,7 +91,7 @@ def positive_int(value: str) -> int:
     return parsed_value
 
 
-def parse_cli_args():
+def parse_cli_args(strict=False):
     """
     Parse command-line arguments for Makefile configuration.
     Returns:
@@ -119,6 +119,9 @@ def parse_cli_args():
         help="Number of tail lines to include in make tool responses (default: 50)",
     )
 
+    if strict:
+        return parser.parse_args()
+
     known_args, _ = parser.parse_known_args()
     return known_args
 
@@ -128,7 +131,7 @@ def initialize_makefile_mcp():
     global MAKEFILE_PATH, WORKING_DIR
 
     # Parse CLI arguments
-    cli_args = parse_cli_args()
+    cli_args = parse_cli_args(strict=True)
 
     # Resolve Makefile path
     if os.path.isabs(cli_args.makefile):

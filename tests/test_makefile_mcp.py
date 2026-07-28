@@ -898,6 +898,37 @@ class TestCommandLineArguments:
         assert args.max_cached_executions == 3
         assert args.tail_lines == 5
 
+    def test_import_tolerates_host_process_arguments(self):
+        """Importing the module ignores arguments owned by the host process."""
+        with patch("sys.argv", ["host-process", "--host-option", "value"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+        assert makefile_mcp.cli_args.makefile == "Makefile"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            [str(pathlib.Path(sys.executable).parent / "makefile-mcp")],
+            [sys.executable, str(pathlib.Path(__file__).parents[1] / "makefile_mcp.py")],
+        ],
+        ids=["console-entry-point", "direct-script"],
+    )
+    def test_executable_startup_rejects_unknown_arguments(self, command):
+        """Executable launch paths reject unknown arguments before starting the server."""
+        result = subprocess.run(
+            [*command, "--exlude", "deploy"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 2
+        assert "unrecognized arguments: --exlude deploy" in result.stderr
+        assert "Starting Makefile MCP server" not in result.stderr
+
 
 class TestErrorHandling:
     """Test error handling scenarios."""

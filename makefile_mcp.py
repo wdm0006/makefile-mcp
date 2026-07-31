@@ -21,6 +21,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
@@ -42,40 +43,50 @@ class CachedExecution:
 
 
 class OutputCache:
-    """Cache for make target execution outputs with eviction."""
+    """Cache for make target execution outputs with eviction.
+
+    Tool bodies run concurrently in FastMCP's worker threadpool, so every access
+    to the cache is serialized by a lock.
+    """
 
     def __init__(self, max_entries: int = 20):
         self.max_entries = max_entries
         self._cache: Dict[int, CachedExecution] = {}
         self._next_id: int = 1
+        self._lock = threading.Lock()
 
     def add(self, target: str, command: str, stdout: str, stderr: str, exit_code: int) -> CachedExecution:
         """Store an execution result and return it. Evicts oldest if over limit."""
-        entry = CachedExecution(
-            execution_id=self._next_id,
-            target=target,
-            command=command,
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            timestamp=time.time(),
-        )
-        self._cache[self._next_id] = entry
-        self._next_id += 1
+        with self._lock:
+            execution_id = self._next_id
+            self._next_id += 1
 
-        # Evict oldest entries if over limit
-        while len(self._cache) > self.max_entries:
-            oldest_id = min(self._cache.keys())
-            del self._cache[oldest_id]
+            entry = CachedExecution(
+                execution_id=execution_id,
+                target=target,
+                command=command,
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+                timestamp=time.time(),
+            )
+            self._cache[execution_id] = entry
 
-        return entry
+            # Evict oldest entries if over limit
+            while len(self._cache) > self.max_entries:
+                oldest_id = min(self._cache.keys())
+                del self._cache[oldest_id]
+
+            return entry
 
     def get(self, execution_id: int) -> Optional[CachedExecution]:
         """Retrieve a cached execution by ID."""
-        return self._cache.get(execution_id)
+        with self._lock:
+            return self._cache.get(execution_id)
 
     def __len__(self) -> int:
-        return len(self._cache)
+        with self._lock:
+            return len(self._cache)
 
 
 # Global variables

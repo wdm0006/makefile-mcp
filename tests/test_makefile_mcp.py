@@ -13,6 +13,7 @@ import subprocess
 # Import the makefile MCP components
 import sys
 import tempfile
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1170,6 +1171,54 @@ class TestOutputCache:
         """Test that getting a non-existent ID returns None."""
         cache = self._get_cache()
         assert cache.get(999) is None
+
+    def test_concurrent_add_keeps_ids_and_payloads_together(self):
+        """Concurrent add() calls must return unique IDs that resolve to their own payload."""
+        threads_count = 12
+        adds_per_thread = 40
+        cache = self._get_cache(max_entries=threads_count * adds_per_thread)
+
+        results = []
+        results_lock = threading.Lock()
+        start = threading.Barrier(threads_count)
+
+        def worker(thread_index):
+            start.wait()
+            local = []
+            for call_index in range(adds_per_thread):
+                payload = f"t{thread_index}-{call_index}"
+                entry = cache.add(payload, f"make {payload}", payload, "", 0)
+                local.append((entry.execution_id, payload))
+            with results_lock:
+                results.extend(local)
+
+        original_switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(threads_count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            sys.setswitchinterval(original_switch_interval)
+
+        expected_total = threads_count * adds_per_thread
+        assert len(results) == expected_total
+
+        # The property that actually breaks without a lock: the execution_id handed
+        # back to a caller must address the entry that same call stored.
+        mismatched = [
+            (execution_id, payload)
+            for execution_id, payload in results
+            if cache.get(execution_id) is None or cache.get(execution_id).stdout != payload
+        ]
+        assert mismatched == [], f"{len(mismatched)} execution_ids resolve to another run's output"
+
+        returned_ids = [execution_id for execution_id, _ in results]
+        assert len(set(returned_ids)) == expected_total, "add() handed the same execution_id to two callers"
+
+        assert len(cache) == expected_total
 
 
 class TestTailTruncation:

@@ -7,6 +7,7 @@ Tests Makefile parsing, target filtering, tool creation, and command execution.
 
 import os
 import pathlib
+import re
 import subprocess
 
 # Import the makefile MCP components
@@ -1390,6 +1391,61 @@ class TestSearchOutput:
         line_num = search_result["matches"][0]["line_number"]
         get_result = makefile_mcp.get_output(eid, start_line=line_num, end_line=line_num + 1)
         assert "WARNING" in get_result["content"]
+
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 has no stdlib tomllib
+    tomllib = None
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# PEP 723: the metadata block is delimited by `# /// script` and a closing `# ///`,
+# and every content line is prefixed with `# ` (or is a bare `#`).
+_PEP723_BLOCK_RE = re.compile(r"(?m)^# /// script\s*$\n(?P<body>(?:^#(?: .*)?$\n)*)^# ///\s*$")
+
+
+def _read_script_dependencies(script_path):
+    """Extract the `dependencies` list from a file's PEP 723 inline metadata block."""
+    match = _PEP723_BLOCK_RE.search(script_path.read_text(encoding="utf-8"))
+    assert match is not None, f"no PEP 723 script block found in {script_path}"
+    content = "".join(line[2:] if line.startswith("# ") else line[1:] for line in match.group("body").splitlines(True))
+    return tomllib.loads(content)["dependencies"]
+
+
+def _find_requirement(dependencies, name):
+    """Return the single requirement string for `name` from a PEP 508 dependency list."""
+    matches = [dep for dep in dependencies if re.match(rf"^{name}\b", dep.strip())]
+    assert len(matches) == 1, f"expected exactly one '{name}' requirement, got {matches!r}"
+    return matches[0].strip()
+
+
+@pytest.mark.skipif(tomllib is None, reason="tomllib is stdlib only from Python 3.11")
+class TestDependencyDeclarationsAgree:
+    """The fastmcp requirement is declared twice; the two must not drift apart."""
+
+    def test_script_block_matches_pyproject(self):
+        """The PEP 723 block and pyproject.toml must declare the same fastmcp requirement.
+
+        `uv run makefile_mcp.py` builds its environment from the inline block, while the
+        installed console script uses pyproject.toml. If these disagree, the two documented
+        entry points run against different major versions of fastmcp.
+        """
+        with open(REPO_ROOT / "pyproject.toml", "rb") as handle:
+            project_dependencies = tomllib.load(handle)["project"]["dependencies"]
+        script_dependencies = _read_script_dependencies(REPO_ROOT / "makefile_mcp.py")
+
+        assert _find_requirement(script_dependencies, "fastmcp") == _find_requirement(project_dependencies, "fastmcp")
+
+    def test_script_block_requires_fastmcp_3(self):
+        """Guard the major version, which equality alone would not.
+
+        Setting both declarations back to fastmcp 2 would satisfy the equality check above
+        while reintroducing the blocking-sync-tool behavior the 3.x upgrade fixed.
+        """
+        requirement = _find_requirement(_read_script_dependencies(REPO_ROOT / "makefile_mcp.py"), "fastmcp")
+        assert re.search(r">=\s*3\.", requirement), requirement
+        assert re.search(r"<\s*4(\.|,|$)", requirement), requirement
 
 
 if __name__ == "__main__":

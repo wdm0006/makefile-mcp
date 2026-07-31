@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # dependencies = [
-#   "fastmcp>=2.14.0,<3.0.0"
+#   "fastmcp>=3.4.5,<4.0.0"
 # ]
 # ///
 

@@ -8,6 +8,7 @@ Tests Makefile parsing, target filtering, tool creation, and command execution.
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 
 # Import the makefile MCP components
@@ -697,6 +698,14 @@ clean:
             "VAR=1 anothertarget",  # assignment followed by a target
             "--",  # end-of-options marker
             "-- target",
+            # Quoted so shlex yields ONE token: the unquoted spelling splits and is
+            # already caught by the bare-target rule, so it would not exercise this guard.
+            'X="$(shell touch pwned)"',  # make expands the value itself
+            'X="${shell touch pwned}"',  # brace form of the same expansion
+            'X:="$(shell touch pwned)"',  # simply-expanded assignment
+            'X="prefix $(shell touch pwned) suffix"',  # expansion embedded mid-value
+            'X="$(wildcard *)"',  # a function taking no spaces at all
+            "X!='touch pwned'",  # make's shell-assignment operator
         ],
     )
     @patch("subprocess.run")
@@ -751,6 +760,33 @@ clean:
 
             call_args = mock_run.call_args[0][0]
             assert call_args[-len(expected_tail) :] == expected_tail
+
+    @pytest.mark.parametrize(
+        ("additional_args", "expected_fragment"),
+        [
+            ('X="$(shell touch pwned)"', "make expansion reference"),
+            ('X="${shell touch pwned}"', "make expansion reference"),
+            ("X!='touch pwned'", "shell-assignment operator"),
+        ],
+    )
+    @patch("subprocess.run")
+    def test_make_tool_rejection_names_the_expansion(self, mock_run, additional_args, expected_fragment, test_makefile):
+        """The rejection is specific, not the closure's generic unexpected-error fallback."""
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
+            result = make_tool(additional_args=additional_args)
+
+            assert result["status"] == "error"
+            assert result["exit_code"] == -1
+            assert "Rejected additional_args" in result["message"]
+            assert expected_fragment in result["message"]
+            assert "Unexpected error" not in result["message"]
+            mock_run.assert_not_called()
 
     def test_list_available_targets_tool(self, test_makefile):
         """Test the list_available_targets tool."""
@@ -1495,6 +1531,117 @@ class TestDependencyDeclarationsAgree:
         requirement = _find_requirement(_read_script_dependencies(REPO_ROOT / "makefile_mcp.py"), "fastmcp")
         assert re.search(r">=\s*3\.", requirement), requirement
         assert re.search(r"<\s*4(\.|,|$)", requirement), requirement
+
+
+def _make_major_version() -> int:
+    """Return the installed make's major version, or 0 when it cannot be determined."""
+    if shutil.which("make") is None:
+        return 0
+    try:
+        banner = subprocess.run(["make", "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    match = re.search(r"(\d+)\.\d+", banner)
+    return int(match.group(1)) if match else 0
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="requires a make executable")
+class TestRealMakeExpansionRegression:
+    """Prove against a real make that assignment values cannot execute commands."""
+
+    MARKER = "pwned"
+
+    @pytest.fixture
+    def harness(self, tmp_path, monkeypatch):
+        """A Makefile whose only target ignores every variable the caller can set.
+
+        The process cwd moves to the same directory because make evaluates a '!='
+        shell assignment in its invoking directory, not in the '-C' directory, so a
+        marker could otherwise be written outside the space this test inspects.
+        """
+        makefile = tmp_path / "Makefile"
+        makefile.write_text('safe:\n\t@echo "safe target ran"\n')
+        monkeypatch.chdir(tmp_path)
+        return makefile
+
+    def _marker(self, makefile):
+        return makefile.parent / self.MARKER
+
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "X=$(shell touch pwned)",
+            "X=${shell touch pwned}",
+        ],
+    )
+    def test_real_make_would_execute_the_assignment(self, harness, assignment):
+        """Control: the pre-fix argv (validation skipped) really does create the marker.
+
+        Without this the regression below could pass because make ignores the token,
+        rather than because the guard rejected it.
+        """
+        subprocess.run(
+            ["make", "-C", str(harness.parent), "-f", str(harness), "safe", assignment],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert self._marker(harness).exists(), (
+            "make did not expand the assignment; the control is not measuring the bug"
+        )
+
+    @pytest.mark.skipif(_make_major_version() < 4, reason="'!=' shell assignment requires GNU make >= 4.0")
+    def test_real_make_would_run_a_shell_assignment(self, harness):
+        """Control for the '!=' operator, which older make releases do not implement."""
+        subprocess.run(
+            ["make", "-C", str(harness.parent), "-f", str(harness), "safe", "X!=touch pwned"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert self._marker(harness).exists(), "make did not run the shell assignment; the control is not measuring it"
+
+    @pytest.mark.parametrize(
+        "additional_args",
+        [
+            'X="$(shell touch pwned)"',
+            'X="${shell touch pwned}"',
+            "X!='touch pwned'",
+        ],
+    )
+    def test_project_path_never_executes_the_assignment(self, harness, additional_args):
+        """The same input through the generated tool is rejected and runs no command."""
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", str(harness)]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
+            result = make_tool(additional_args=additional_args)
+
+        # The marker assertion carries the security claim, so it runs before the
+        # weaker response-shape assertions and cannot be masked by them.
+        assert not self._marker(harness).exists()
+        assert result["status"] == "error"
+        assert result["exit_code"] == -1
+
+    def test_literal_assignment_still_reaches_real_make(self, harness):
+        """A plain value is not collateral damage: it runs and stays a single argv token."""
+        with patch("sys.argv", ["makefile_mcp.py", "--makefile", str(harness)]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
+            result = make_tool(additional_args='VERBOSE=1 MESSAGE="hello world"')
+
+        assert result["status"] == "success"
+        assert "safe target ran" in result["stdout_tail"]
+        assert result["command"].endswith("safe VERBOSE=1 MESSAGE=hello world")
 
 
 if __name__ == "__main__":

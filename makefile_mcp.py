@@ -367,8 +367,18 @@ def validate_tool_names(targets: Dict[str, str]) -> None:
 
 # A command-line make variable assignment: NAME=value, NAME:=value, NAME::=value,
 # NAME+=value, NAME?=value, NAME!=value. These override variables and cannot select
-# another target, load another makefile, or change directory.
-_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*(?:::|:|\+|\?|!)?=")
+# another target, load another makefile, or change directory. Their values are still
+# make source, so the operator and the value are constrained further below.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*(::|:|\+|\?|!)?=")
+
+# make expands a command-line variable's value itself, so a function reference such
+# as $(shell ...) runs a command even when no recipe reads the variable. shell=False
+# does not constrain that: it is make evaluating make syntax, not a shell.
+_EXPANSION_RE = re.compile(r"\$[({]")
+
+# '!=' is make's shell-assignment operator (GNU make >= 4.0): the whole value is run
+# through a shell regardless of any expansion reference in it.
+_SHELL_ASSIGNMENT_OPERATOR = "!"
 
 # Short option letters that only tune execution and cannot select another target,
 # load/evaluate another makefile, or change directory. Dangerous letters are absent
@@ -414,10 +424,11 @@ _ALLOWED_LONG_FLAGS_OPTIONAL_VALUE = {
 def validate_additional_args(tokens: List[str]) -> Optional[str]:
     """Return an error message if any token falls outside the safe allowlist.
 
-    Accepts make variable assignments and an explicit set of execution-tuning
-    options. Rejects bare targets, end-of-options markers, and any option that
-    could select another target, load/evaluate another makefile, or change
-    directory. Returns None when every token is allowed.
+    Accepts make variable assignments with literal values and an explicit set of
+    execution-tuning options. Rejects bare targets, end-of-options markers, any
+    option that could select another target, load/evaluate another makefile, or
+    change directory, and any assignment value carrying a make expansion
+    reference. Returns None when every token is allowed.
     """
     i = 0
     n = len(tokens)
@@ -428,7 +439,15 @@ def validate_additional_args(tokens: List[str]) -> Optional[str]:
             return "'--' is not allowed; following tokens would be treated as targets"
 
         if not tok.startswith("-"):
-            if _ASSIGNMENT_RE.match(tok):
+            assignment = _ASSIGNMENT_RE.match(tok)
+            if assignment:
+                if assignment.group(1) == _SHELL_ASSIGNMENT_OPERATOR:
+                    return f"'{tok}' uses make's '!=' shell-assignment operator; its value would be run by a shell"
+                if _EXPANSION_RE.search(tok[assignment.end() :]):
+                    return (
+                        f"'{tok}' contains a make expansion reference ('$(' or '${{'); "
+                        "assignment values must be literal"
+                    )
                 i += 1
                 continue
             return f"'{tok}' is not an allowed variable assignment or option (it would select another target)"

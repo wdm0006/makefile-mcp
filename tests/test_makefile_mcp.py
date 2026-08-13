@@ -1478,6 +1478,116 @@ class TestSearchOutput:
         assert "WARNING" in get_result["content"]
 
 
+class TestSearchOutputBounds:
+    """Test search_output input validation and result bounding."""
+
+    def _setup(self, warning_count=40):
+        """Cache an output where every other line matches 'WARNING'."""
+        with patch("sys.argv", ["makefile_mcp.py"]):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+            import makefile_mcp
+
+            lines = []
+            for i in range(warning_count):
+                lines.append(f"Compiling file{i}.c")
+                lines.append(f"WARNING: issue {i}")
+            output = "\n".join(lines) + "\n"
+            entry = makefile_mcp.output_cache.add("build", "make build", output, "", 0)
+            return makefile_mcp, entry.execution_id
+
+    def test_empty_pattern_rejected(self):
+        """An empty pattern would match every cached line and is rejected."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "")
+        assert result["status"] == "error"
+        assert "must not be empty" in result["message"]
+        assert "matches" not in result
+
+    def test_negative_context_lines_rejected(self):
+        """Negative context sizes produce incoherent ranges and are rejected."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "WARNING", context_lines=-1)
+        assert result["status"] == "error"
+        assert "context_lines" in result["message"]
+        assert "matches" not in result
+
+    def test_zero_context_lines_allowed(self):
+        """Zero context is valid and returns only the matching line."""
+        makefile_mcp, eid = self._setup()
+        result = makefile_mcp.search_output(eid, "WARNING: issue 0", context_lines=0)
+        assert result["status"] == "success"
+        assert result["total_matches"] == 1
+        assert result["matches"][0]["context"] == [{"line_number": 1, "text": "WARNING: issue 0", "is_match": True}]
+
+    def test_non_positive_max_results_rejected(self):
+        """max_results must be positive."""
+        makefile_mcp, eid = self._setup()
+        for bad in (0, -5):
+            result = makefile_mcp.search_output(eid, "WARNING", max_results=bad)
+            assert result["status"] == "error"
+            assert "max_results" in result["message"]
+            assert "matches" not in result
+
+    def test_default_cap_truncates_and_reports_full_count(self):
+        """The default cap bounds returned matches while counting them all."""
+        makefile_mcp, eid = self._setup(warning_count=40)
+        result = makefile_mcp.search_output(eid, "WARNING", context_lines=1)
+
+        cap = makefile_mcp.DEFAULT_MAX_SEARCH_RESULTS
+        assert cap == 20
+        assert result["status"] == "success"
+        assert result["total_matches"] == 40
+        assert result["returned_matches"] == cap
+        assert len(result["matches"]) == cap
+        assert result["max_results"] == cap
+        assert result["truncated"] is True
+        assert "20 of 40 matches" in result["truncation_note"]
+        assert f"get_output(execution_id={eid})" in result["truncation_note"]
+
+        # The bounded prefix is the first matches in line order.
+        assert [m["line_number"] for m in result["matches"]] == [2 * i + 1 for i in range(cap)]
+        assert result["matches"][0]["text"] == "WARNING: issue 0"
+        assert result["matches"][-1]["text"] == f"WARNING: issue {cap - 1}"
+
+    def test_explicit_max_results_caps_matches(self):
+        """An explicit max_results overrides the default cap."""
+        makefile_mcp, eid = self._setup(warning_count=40)
+        result = makefile_mcp.search_output(eid, "WARNING", max_results=3)
+
+        assert result["total_matches"] == 40
+        assert result["returned_matches"] == 3
+        assert result["max_results"] == 3
+        assert result["truncated"] is True
+        assert [m["line_number"] for m in result["matches"]] == [1, 3, 5]
+
+    def test_uncapped_search_returns_every_match(self):
+        """A search below the cap returns all matches and reports no truncation."""
+        makefile_mcp, eid = self._setup(warning_count=5)
+        result = makefile_mcp.search_output(eid, "WARNING", context_lines=1)
+
+        assert result["total_matches"] == 5
+        assert result["returned_matches"] == 5
+        assert result["truncated"] is False
+        assert "truncation_note" not in result
+        assert [m["line_number"] for m in result["matches"]] == [1, 3, 5, 7, 9]
+        assert [m["text"] for m in result["matches"]] == [f"WARNING: issue {i}" for i in range(5)]
+        assert result["matches"][0]["context"] == [
+            {"line_number": 0, "text": "Compiling file0.c", "is_match": False},
+            {"line_number": 1, "text": "WARNING: issue 0", "is_match": True},
+            {"line_number": 2, "text": "Compiling file1.c", "is_match": False},
+        ]
+
+    def test_no_matches_is_not_truncated(self):
+        """A zero-match search reports no truncation."""
+        makefile_mcp, eid = self._setup(warning_count=5)
+        result = makefile_mcp.search_output(eid, "NONEXISTENT_PATTERN")
+        assert result["total_matches"] == 0
+        assert result["returned_matches"] == 0
+        assert result["truncated"] is False
+        assert result["matches"] == []
+
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 has no stdlib tomllib

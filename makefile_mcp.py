@@ -28,6 +28,11 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastmcp import FastMCP
 
+# search_output() repeats a context window for every match it returns, so an
+# unbounded result list would defeat the bounded inline-output design. Callers
+# that need more can raise max_results or page with get_output().
+DEFAULT_MAX_SEARCH_RESULTS = 20
+
 
 @dataclass
 class CachedExecution:
@@ -724,19 +729,47 @@ def get_output(execution_id: int, stream: str = "stdout", start_line: int = 0, e
     }
 
 
-def search_output(execution_id: int, pattern: str, stream: str = "stdout", context_lines: int = 3) -> Dict[str, Any]:
+def search_output(
+    execution_id: int,
+    pattern: str,
+    stream: str = "stdout",
+    context_lines: int = 3,
+    max_results: int = DEFAULT_MAX_SEARCH_RESULTS,
+) -> Dict[str, Any]:
     """
     Search cached output from a previous make target execution.
 
     Args:
         execution_id: The execution ID returned by a make target tool.
-        pattern: Substring to search for (case-insensitive).
+        pattern: Non-empty substring to search for (case-insensitive, literal).
         stream: Which output stream to search — "stdout" or "stderr".
-        context_lines: Number of surrounding lines to include with each match.
+        context_lines: Number of surrounding lines to include with each match (>= 0).
+        max_results: Maximum number of matches to return (>= 1, defaults to
+            DEFAULT_MAX_SEARCH_RESULTS = 20). Every match is still counted in
+            total_matches; use get_output() around the returned line numbers to
+            read past the cap.
 
     Returns:
         dict: Matching lines with context and line numbers.
     """
+    if not pattern:
+        return {
+            "status": "error",
+            "message": "Search pattern must not be empty. Provide a literal substring to search for.",
+        }
+
+    if context_lines < 0:
+        return {
+            "status": "error",
+            "message": f"Invalid context_lines {context_lines}. Must be 0 or greater.",
+        }
+
+    if max_results < 1:
+        return {
+            "status": "error",
+            "message": f"Invalid max_results {max_results}. Must be 1 or greater.",
+        }
+
     cached = output_cache.get(execution_id)
     if cached is None:
         return {
@@ -757,10 +790,12 @@ def search_output(execution_id: int, pattern: str, stream: str = "stdout", conte
 
     # Find matching line indices
     match_indices = [i for i, line in enumerate(lines) if pattern_lower in line.lower()]
+    total_matches = len(match_indices)
 
-    # Build matches with context
+    # Build matches with context, bounded to the first max_results matches so one
+    # response cannot repeat a context window for every line of a large log.
     matches: List[Dict[str, Any]] = []
-    for idx in match_indices:
+    for idx in match_indices[:max_results]:
         ctx_start = max(0, idx - context_lines)
         ctx_end = min(total_lines, idx + context_lines + 1)
         context = [{"line_number": i, "text": lines[i], "is_match": i == idx} for i in range(ctx_start, ctx_end)]
@@ -772,16 +807,28 @@ def search_output(execution_id: int, pattern: str, stream: str = "stdout", conte
             }
         )
 
-    return {
+    result: Dict[str, Any] = {
         "status": "success",
         "execution_id": execution_id,
         "target": cached.target,
         "stream": stream,
         "pattern": pattern,
         "total_lines": total_lines,
-        "total_matches": len(matches),
+        "total_matches": total_matches,
+        "returned_matches": len(matches),
+        "max_results": max_results,
+        "truncated": total_matches > len(matches),
         "matches": matches,
     }
+
+    if result["truncated"]:
+        result["truncation_note"] = (
+            f"Returned the first {len(matches)} of {total_matches} matches. "
+            "Narrow the pattern, raise max_results, or use "
+            f"get_output(execution_id={execution_id}) around the returned line numbers."
+        )
+
+    return result
 
 
 # Register utility tools with MCP server

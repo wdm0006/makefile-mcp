@@ -167,21 +167,17 @@ def initialize_makefile_mcp():
     return cli_args
 
 
-# Initialize only when running as script, not when imported
-if __name__ == "__main__":
-    cli_args = initialize_makefile_mcp()
+# Module load sets tolerant defaults without validation; strict startup happens in main().
+cli_args = parse_cli_args()
+if os.path.isabs(cli_args.makefile):
+    MAKEFILE_PATH = pathlib.Path(cli_args.makefile)
 else:
-    # For imports (like tests), set up defaults without validation
-    cli_args = parse_cli_args()
-    if os.path.isabs(cli_args.makefile):
-        MAKEFILE_PATH = pathlib.Path(cli_args.makefile)
-    else:
-        MAKEFILE_PATH = pathlib.Path.cwd() / cli_args.makefile
+    MAKEFILE_PATH = pathlib.Path.cwd() / cli_args.makefile
 
-    if cli_args.working_dir:
-        WORKING_DIR = pathlib.Path(cli_args.working_dir).resolve()
-    else:
-        WORKING_DIR = MAKEFILE_PATH.parent.resolve() if MAKEFILE_PATH.exists() else pathlib.Path.cwd()
+if cli_args.working_dir:
+    WORKING_DIR = pathlib.Path(cli_args.working_dir).resolve()
+else:
+    WORKING_DIR = MAKEFILE_PATH.parent.resolve() if MAKEFILE_PATH.exists() else pathlib.Path.cwd()
 
 # Parse include/exclude lists
 INCLUDE_TARGETS: Optional[Set[str]] = None
@@ -292,12 +288,9 @@ def get_makefile_targets():
     return filtered_targets
 
 
-# Initialize targets only when running as script
-if __name__ == "__main__":
-    filtered_targets = get_makefile_targets()
-else:
-    # For imports, initialize as empty dict
-    filtered_targets = {}
+# Targets are discovered and registered by main(), so both the console script and
+# `uv run makefile_mcp.py` register each target exactly once.
+filtered_targets: Dict[str, str] = {}
 
 
 def _tail_lines(text: str, n: int) -> tuple[str, bool]:
@@ -615,14 +608,6 @@ def register_make_tools(targets: Dict[str, str]):
     """Validate and register MCP tools for make targets."""
     validate_tool_names(targets)
     return [(target_name, create_make_tool(target_name, description)) for target_name, description in targets.items()]
-
-
-# Create tools for each filtered target
-try:
-    created_tools = register_make_tools(filtered_targets)
-except ValueError as e:
-    print(f"Error: {e}", file=sys.stderr)
-    sys.exit(1)
 
 
 def list_available_targets() -> Dict[str, Any]:

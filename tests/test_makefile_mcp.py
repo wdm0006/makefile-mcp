@@ -5,9 +5,11 @@ Comprehensive test suite for the Makefile MCP Server
 Tests Makefile parsing, target filtering, tool creation, and command execution.
 """
 
+import contextlib
 import os
 import pathlib
 import re
+import runpy
 import shutil
 import subprocess
 
@@ -1642,6 +1644,91 @@ class TestRealMakeExpansionRegression:
         assert result["status"] == "success"
         assert "safe target ran" in result["stdout_tail"]
         assert result["command"].endswith("safe VERBOSE=1 MESSAGE=hello world")
+
+
+class TestSingleToolRegistration:
+    """Every startup path registers each discovered target exactly once."""
+
+    MODULE_PATH = pathlib.Path(__file__).resolve().parent.parent / "makefile_mcp.py"
+    MAKEFILE_CONTENT = "# Build it\nbuild:\n\techo build\n\n# Test it\ntest:\n\techo test\n"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _recorded_registrations():
+        """Record the name of every function registered as a tool, keeping registration real."""
+        import fastmcp
+
+        registered = []
+        original_tool = fastmcp.FastMCP.tool
+
+        def recording_tool(self, *args, **kwargs):
+            decorator = original_tool(self, *args, **kwargs)
+
+            def record(fn):
+                registered.append(fn.__name__)
+                return decorator(fn)
+
+            return record
+
+        with patch.object(fastmcp.FastMCP, "tool", recording_tool):
+            yield registered
+
+    def test_direct_script_registers_each_target_once(self, tmp_path):
+        """`uv run makefile_mcp.py` executes the module as __main__ and registers one tool per target."""
+        import fastmcp
+
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text(self.MAKEFILE_CONTENT)
+
+        argv = ["makefile_mcp.py", "--makefile", str(makefile_path)]
+        with patch("sys.argv", argv), self._recorded_registrations() as registered:
+            with patch.object(fastmcp.FastMCP, "run") as run:
+                module_globals = runpy.run_path(str(self.MODULE_PATH), run_name="__main__")
+
+        # The registration counts carry the regression claim, so they run before the
+        # weaker lifecycle assertions and cannot be masked by them.
+        assert registered.count("make_build") == 1
+        assert registered.count("make_test") == 1
+        for utility in ("list_available_targets", "get_makefile_info", "get_output", "search_output"):
+            assert registered.count(utility) == 1
+        assert module_globals["filtered_targets"] == {"build": "Build it", "test": "Test it"}
+        run.assert_called_once_with()
+
+    def test_imported_main_registers_each_target_once(self, tmp_path):
+        """The console-script entry point registers one tool per target too."""
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text(self.MAKEFILE_CONTENT)
+
+        argv = ["makefile_mcp.py", "--makefile", str(makefile_path)]
+        with patch("sys.argv", argv):
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+            with self._recorded_registrations() as registered:
+                with patch.object(makefile_mcp.mcp_server, "run") as run:
+                    makefile_mcp.main()
+
+        assert registered.count("make_build") == 1
+        assert registered.count("make_test") == 1
+        assert makefile_mcp.filtered_targets == {"build": "Build it", "test": "Test it"}
+        run.assert_called_once_with()
+
+    def test_import_alone_registers_no_target_tools(self, tmp_path):
+        """Importing the module must not register target tools before main() validates configuration."""
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text(self.MAKEFILE_CONTENT)
+
+        argv = ["makefile_mcp.py", "--makefile", str(makefile_path)]
+        with patch("sys.argv", argv), self._recorded_registrations() as registered:
+            if "makefile_mcp" in sys.modules:
+                del sys.modules["makefile_mcp"]
+
+            import makefile_mcp
+
+        assert [name for name in registered if name.startswith("make_")] == []
+        assert makefile_mcp.filtered_targets == {}
 
 
 if __name__ == "__main__":

@@ -34,13 +34,16 @@ from fastmcp.client.transports import StdioTransport
 
 REPO = pathlib.Path("/home/user/work/makefile-mcp")
 
+
 async def main():
-    t = StdioTransport(command=str(REPO / ".venv/bin/python"),
-                       args=[str(REPO / "makefile_mcp.py"), "--makefile", "/path/to/Makefile"])
+    t = StdioTransport(
+        command=str(REPO / ".venv/bin/python"), args=[str(REPO / "makefile_mcp.py"), "--makefile", "/path/to/Makefile"]
+    )
     async with Client(t) as client:
         tools = sorted(x.name for x in await client.list_tools())
-        r = await client.call_tool("make_hello", {})          # a target from your Makefile
+        r = await client.call_tool("make_hello", {})  # a target from your Makefile
         print(r.content[0].text)
+
 
 asyncio.run(main())
 ```

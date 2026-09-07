@@ -107,6 +107,7 @@ class ServerConfig:
     exclude_targets: Set[str]
     max_cached_executions: int
     tail_lines: int
+    timeout_seconds: int
 
 
 def positive_int(value: str) -> int:
@@ -149,6 +150,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=50,
         help="Number of tail lines to include in make tool responses (default: 50)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=300,
+        help="Seconds to wait before a running make target is killed (default: 300)",
+    )
 
     return parser.parse_args(argv)
 
@@ -178,6 +185,7 @@ def build_config(cli_args: argparse.Namespace) -> ServerConfig:
         exclude_targets=_parse_target_list(cli_args.exclude) or set(),
         max_cached_executions=cli_args.max_cached_executions,
         tail_lines=cli_args.tail_lines,
+        timeout_seconds=cli_args.timeout,
     )
 
 
@@ -527,7 +535,7 @@ class MakefileServer:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=300,  # 5 minute timeout
+                    timeout=config.timeout_seconds,
                 )
 
                 # Cache full output
@@ -579,7 +587,7 @@ class MakefileServer:
                     "command": command_str,
                     "working_directory": str(config.working_dir),
                     "status": "error",
-                    "message": f"Target '{target_name}' timed out after 5 minutes",
+                    "message": f"Target '{target_name}' timed out after {config.timeout_seconds} seconds",
                     "exit_code": -1,
                     **_bounded_output_fields(partial_stdout, partial_stderr, config.tail_lines, cached.execution_id),
                 }

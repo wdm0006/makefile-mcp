@@ -229,8 +229,11 @@ class MakefileParser:
             target_match = re.match(r"^([a-zA-Z0-9_.-][a-zA-Z0-9_.\- ]*?)\s*:(?![:=])", line)
             if target_match:
                 for target_name in target_match.group(1).split():
-                    # Skip special targets that start with . or contain %
-                    if target_name.startswith(".") or "%" in target_name:
+                    # Skip special targets that start with "." (e.g. .PHONY).
+                    # Pattern rules ("%.o: ...") never match the target regex at
+                    # all — its character classes exclude "%" — so no matched
+                    # name can hold one; no separate check is needed.
+                    if target_name.startswith("."):
                         continue
 
                     # Apply the preceding comment to every target on the rule,

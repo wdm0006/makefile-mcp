@@ -330,6 +330,28 @@ def _as_text(stream: Any) -> str:
     return str(stream)
 
 
+def _lookup_cached_stream(
+    cache: OutputCache, execution_id: int, stream: str
+) -> tuple[Optional[CachedExecution], Optional[Dict[str, Any]]]:
+    """Resolve the preconditions shared by get_output() and search_output().
+
+    Returns (entry, None) when the execution is cached and the stream name is
+    valid, or (None, error_response) describing the failure otherwise.
+    """
+    cached = cache.get(execution_id)
+    if cached is None:
+        return None, {
+            "status": "error",
+            "message": f"Execution ID {execution_id} not found in cache.",
+        }
+    if stream not in ("stdout", "stderr"):
+        return None, {
+            "status": "error",
+            "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
+        }
+    return cached, None
+
+
 def make_tool_name(target_name: str) -> str:
     """Return the MCP tool name for a make target."""
     return f"make_{target_name.replace('-', '_').replace('.', '_')}"
@@ -591,18 +613,14 @@ class MakefileServer:
                     "exit_code": -1,
                     **_bounded_output_fields(partial_stdout, partial_stderr, config.tail_lines, cached.execution_id),
                 }
-            except subprocess.SubprocessError as e:
+            except (subprocess.SubprocessError, OSError) as e:
+                # Subprocess failures and OS-level execution errors (e.g. the make
+                # binary itself missing or not executable) are reported structurally;
+                # anything else is a bug and must surface instead of being masked.
                 return {
                     "target": target_name,
                     "status": "error",
                     "message": f"Failed to execute target '{target_name}': {str(e)}",
-                    "exit_code": -1,
-                }
-            except Exception as e:
-                return {
-                    "target": target_name,
-                    "status": "error",
-                    "message": f"Unexpected error executing target '{target_name}': {str(e)}",
                     "exit_code": -1,
                 }
 
@@ -692,18 +710,9 @@ class MakefileServer:
         Returns:
             dict: The requested lines and metadata.
         """
-        cached = self.output_cache.get(execution_id)
-        if cached is None:
-            return {
-                "status": "error",
-                "message": f"Execution ID {execution_id} not found in cache.",
-            }
-
-        if stream not in ("stdout", "stderr"):
-            return {
-                "status": "error",
-                "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
-            }
+        cached, error = _lookup_cached_stream(self.output_cache, execution_id, stream)
+        if error is not None:
+            return error
 
         text = cached.stdout if stream == "stdout" else cached.stderr
         lines = text.splitlines(keepends=True)
@@ -768,18 +777,9 @@ class MakefileServer:
                 "message": f"Invalid max_results {max_results}. Must be 1 or greater.",
             }
 
-        cached = self.output_cache.get(execution_id)
-        if cached is None:
-            return {
-                "status": "error",
-                "message": f"Execution ID {execution_id} not found in cache.",
-            }
-
-        if stream not in ("stdout", "stderr"):
-            return {
-                "status": "error",
-                "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
-            }
+        cached, error = _lookup_cached_stream(self.output_cache, execution_id, stream)
+        if error is not None:
+            return error
 
         text = cached.stdout if stream == "stdout" else cached.stderr
         lines = text.splitlines()

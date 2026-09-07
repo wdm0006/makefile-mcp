@@ -877,6 +877,30 @@ class TestErrorHandling:
         assert "Failed to execute" in result["message"]
         assert result["exit_code"] == -1
 
+    @patch("subprocess.run")
+    def test_os_error_is_reported_structurally(self, mock_run, server_factory):
+        """A missing make binary is a tool-level failure, not a crash."""
+        mock_run.side_effect = FileNotFoundError(2, "No such file or directory", "make")
+
+        server = server_factory(makefile_text="test:\n\techo 'test'")
+        make_tool = server.create_make_tool("test", "Test target")
+        result = make_tool()
+
+        assert result["status"] == "error"
+        assert "Failed to execute" in result["message"]
+        assert result["exit_code"] == -1
+
+    @patch("subprocess.run")
+    def test_unexpected_errors_propagate(self, mock_run, server_factory):
+        """Non-execution errors are bugs: they surface instead of being masked."""
+        mock_run.side_effect = RuntimeError("programming bug")
+
+        server = server_factory(makefile_text="test:\n\techo 'test'")
+        make_tool = server.create_make_tool("test", "Test target")
+
+        with pytest.raises(RuntimeError, match="programming bug"):
+            make_tool()
+
 
 class TestTimeoutPartialOutput:
     """Test that partial output captured before a timeout is preserved."""

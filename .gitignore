@@ -35,3 +35,4 @@ venv/
 .mypy_cache/
 .ruff_cache/
 uv.lock
+mutants/

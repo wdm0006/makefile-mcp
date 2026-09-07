@@ -126,12 +126,17 @@ class TestParserContract:
         assert not any("%" in name for name in targets)
 
     def test_pattern_rules_are_not_targets(self, tmp_path):
-        """Implicit pattern rules (%.o: %.c) must not surface as runnable targets."""
+        """Pattern rules must not surface as runnable targets.
+
+        Uses a mid-name stem (app%.o) — a leading-% rule never matches the
+        parser's target regex at all, so only a mid-name % exercises the skip.
+        """
         makefile = write_makefile(
             tmp_path,
-            "# Build\nbuild: app.o\n\ttrue\n\n%.o: %.c\n\ttrue\n\n# Clean\nclean:\n\ttrue\n",
+            "# Build\nbuild: app.o\n\ttrue\n\napp%.o: app.c\n\ttrue\n\n# Clean\nclean:\n\ttrue\n",
         )
         targets = makefile_mcp.MakefileParser(makefile).get_targets()
+        assert "app%.o" not in targets
         assert "%.o" not in targets
         assert "%.c" not in targets
         assert targets == {"build": "Build", "clean": "Clean"}
@@ -272,6 +277,14 @@ class TestToolResponseContract:
         assert result["message"] == "Successfully executed target 'build'"
         assert result["stdout_total_lines"] == 1
         assert result["stdout_tail"] == "Building project...\n"
+
+        # The cache entry must mirror the response for the fields consumers
+        # address by execution id.
+        cached = server.output_cache.get(result["execution_id"])
+        assert cached is not None
+        assert cached.command == result["command"]
+        assert cached.exit_code == 0
+        assert cached.stdout == "Building project...\n"
 
     def test_make_tool_argument_error_contract(self, server_factory):
         server = server_factory()

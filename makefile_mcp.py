@@ -15,7 +15,6 @@ Usage: uv run makefile_mcp.py [--makefile PATH] [--include TARGET1,TARGET2] [--e
 """
 
 import argparse
-import os
 import pathlib
 import re
 import shlex
@@ -94,9 +93,20 @@ class OutputCache:
             return len(self._cache)
 
 
-# Global variables
-MAKEFILE_PATH = None
-WORKING_DIR = None
+@dataclass(frozen=True)
+class ServerConfig:
+    """Immutable runtime configuration resolved from CLI arguments.
+
+    Everything a registered tool needs to run is bound here at initialization
+    time; no tool reads module state afterwards.
+    """
+
+    makefile_path: pathlib.Path
+    working_dir: pathlib.Path
+    include_targets: Optional[Set[str]]
+    exclude_targets: Set[str]
+    max_cached_executions: int
+    tail_lines: int
 
 
 def positive_int(value: str) -> int:
@@ -107,9 +117,14 @@ def positive_int(value: str) -> int:
     return parsed_value
 
 
-def parse_cli_args(strict=False):
+def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
     Parse command-line arguments for Makefile configuration.
+
+    Args:
+        argv: Argument tokens to parse; defaults to sys.argv, the process's own
+            arguments. Tests and embedders pass an explicit list instead.
+
     Returns:
         argparse.Namespace: Parsed arguments.
     """
@@ -135,69 +150,35 @@ def parse_cli_args(strict=False):
         help="Number of tail lines to include in make tool responses (default: 50)",
     )
 
-    if strict:
-        return parser.parse_args()
-
-    known_args, _ = parser.parse_known_args()
-    return known_args
+    return parser.parse_args(argv)
 
 
-def initialize_makefile_mcp():
-    """Initialize the makefile MCP server with validation."""
-    global MAKEFILE_PATH, WORKING_DIR
+def _parse_target_list(value: Optional[str]) -> Optional[Set[str]]:
+    """Parse a comma-separated target list. None means the filter is not set."""
+    if not value:
+        return None
+    return {target.strip() for target in value.split(",")}
 
-    # Parse CLI arguments
-    cli_args = parse_cli_args(strict=True)
 
-    # Resolve Makefile path
-    if os.path.isabs(cli_args.makefile):
-        MAKEFILE_PATH = pathlib.Path(cli_args.makefile)
-    else:
-        MAKEFILE_PATH = pathlib.Path.cwd() / cli_args.makefile
+def build_config(cli_args: argparse.Namespace) -> ServerConfig:
+    """Resolve parsed CLI arguments into an immutable server configuration."""
+    makefile_path = pathlib.Path(cli_args.makefile)
+    if not makefile_path.is_absolute():
+        makefile_path = pathlib.Path.cwd() / makefile_path
 
-    if not MAKEFILE_PATH.exists():
-        print(f"Error: Makefile not found at {MAKEFILE_PATH}", file=sys.stderr)
-        sys.exit(1)
-
-    # Set working directory
     if cli_args.working_dir:
-        WORKING_DIR = pathlib.Path(cli_args.working_dir).resolve()
+        working_dir = pathlib.Path(cli_args.working_dir).resolve()
     else:
-        WORKING_DIR = MAKEFILE_PATH.parent.resolve()
+        working_dir = makefile_path.parent.resolve()
 
-    if not WORKING_DIR.is_dir():
-        print(f"Error: Working directory not found: {WORKING_DIR}", file=sys.stderr)
-        sys.exit(1)
-
-    return cli_args
-
-
-# Module load sets tolerant defaults without validation; strict startup happens in main().
-cli_args = parse_cli_args()
-if os.path.isabs(cli_args.makefile):
-    MAKEFILE_PATH = pathlib.Path(cli_args.makefile)
-else:
-    MAKEFILE_PATH = pathlib.Path.cwd() / cli_args.makefile
-
-if cli_args.working_dir:
-    WORKING_DIR = pathlib.Path(cli_args.working_dir).resolve()
-else:
-    WORKING_DIR = MAKEFILE_PATH.parent.resolve() if MAKEFILE_PATH.exists() else pathlib.Path.cwd()
-
-# Parse include/exclude lists
-INCLUDE_TARGETS: Optional[Set[str]] = None
-if cli_args.include:
-    INCLUDE_TARGETS = {target.strip() for target in cli_args.include.split(",")}
-
-EXCLUDE_TARGETS: Set[str] = set()
-if cli_args.exclude:
-    EXCLUDE_TARGETS = {target.strip() for target in cli_args.exclude.split(",")}
-
-# MCP Server instance
-mcp_server = FastMCP("MakefileMCP")
-
-# Output cache instance
-output_cache = OutputCache(max_entries=cli_args.max_cached_executions)
+    return ServerConfig(
+        makefile_path=makefile_path,
+        working_dir=working_dir,
+        include_targets=_parse_target_list(cli_args.include),
+        exclude_targets=_parse_target_list(cli_args.exclude) or set(),
+        max_cached_executions=cli_args.max_cached_executions,
+        tail_lines=cli_args.tail_lines,
+    )
 
 
 class MakefileParser:
@@ -279,23 +260,18 @@ class MakefileParser:
         return targets
 
 
-def get_makefile_targets():
+def get_makefile_targets(config: ServerConfig) -> Dict[str, str]:
     """Parse the Makefile and return filtered targets."""
-    if not MAKEFILE_PATH or not MAKEFILE_PATH.exists():
+    if not config.makefile_path.exists():
         return {}
 
-    parser = MakefileParser(MAKEFILE_PATH)
-    filtered_targets = parser.get_filtered_targets(INCLUDE_TARGETS, EXCLUDE_TARGETS)
+    parser = MakefileParser(config.makefile_path)
+    filtered_targets = parser.get_filtered_targets(config.include_targets, config.exclude_targets)
 
     if not filtered_targets:
         print("Warning: No targets found or all targets filtered out", file=sys.stderr)
 
     return filtered_targets
-
-
-# Targets are discovered and registered by main(), so both the console script and
-# `uv run makefile_mcp.py` register each target exactly once.
-filtered_targets: Dict[str, str] = {}
 
 
 def _tail_lines(text: str, n: int) -> tuple[str, bool]:
@@ -487,380 +463,415 @@ def validate_additional_args(tokens: List[str]) -> Optional[str]:
     return None
 
 
-def create_make_tool(target_name: str, description: str):
-    """Create an MCP tool for a specific make target."""
+class MakefileServer:
+    """An MCP server exposing one Makefile's targets, bound to one configuration.
 
-    def make_target(additional_args: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
-        """Execute the make target with optional arguments and dry-run capability."""
-        extra_args: List[str] = []
-        if additional_args:
+    Instances are created only by initialize_makefile_mcp(): the constructor owns
+    every piece of mutable state (the FastMCP instance, the output cache, the
+    discovered targets), so independent instances — including servers built by
+    tests — cannot leak configuration or registrations into each other.
+    """
+
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.mcp_server = FastMCP("MakefileMCP")
+        self.output_cache = OutputCache(max_entries=config.max_cached_executions)
+        self.filtered_targets: Dict[str, str] = get_makefile_targets(config)
+        self._register_utility_tools()
+
+    def _register_utility_tools(self) -> None:
+        """Register the four utility tools every server exposes."""
+        self.mcp_server.tool()(self.list_available_targets)
+        self.mcp_server.tool()(self.get_makefile_info)
+        self.mcp_server.tool()(self.get_output)
+        self.mcp_server.tool()(self.search_output)
+
+    def create_make_tool(self, target_name: str, description: str):
+        """Create an MCP tool for a specific make target."""
+        config = self.config
+
+        def make_target(additional_args: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
+            """Execute the make target with optional arguments and dry-run capability."""
+            extra_args: List[str] = []
+            if additional_args:
+                try:
+                    extra_args = shlex.split(additional_args)
+                except ValueError as e:
+                    return {
+                        "target": target_name,
+                        "status": "error",
+                        "message": f"Invalid additional_args for target '{target_name}': {str(e)}",
+                        "exit_code": -1,
+                    }
+
+                arg_error = validate_additional_args(extra_args)
+                if arg_error is not None:
+                    return {
+                        "target": target_name,
+                        "status": "error",
+                        "message": f"Rejected additional_args for target '{target_name}': {arg_error}",
+                        "exit_code": -1,
+                    }
+
             try:
-                extra_args = shlex.split(additional_args)
-            except ValueError as e:
+                # Build the make command
+                cmd = ["make", "-C", str(config.working_dir), "-f", str(config.makefile_path), target_name]
+
+                if dry_run:
+                    cmd.append("-n")  # Dry run flag for make
+
+                cmd.extend(extra_args)
+
+                # Execute the command - safe execution with list of args, no shell injection risk
+                result = subprocess.run(  # noqa: S603
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minute timeout
+                )
+
+                # Cache full output
+                command_str = " ".join(cmd)
+                cached = self.output_cache.add(
+                    target=target_name,
+                    command=command_str,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    exit_code=result.returncode,
+                )
+
+                response = {
+                    "target": target_name,
+                    "command": command_str,
+                    "working_directory": str(config.working_dir),
+                    "exit_code": result.returncode,
+                    **_bounded_output_fields(result.stdout, result.stderr, config.tail_lines, cached.execution_id),
+                }
+
+                if dry_run:
+                    response["note"] = "This was a dry run - no commands were actually executed"
+
+                if result.returncode == 0:
+                    response["status"] = "success"
+                    response["message"] = f"Successfully executed target '{target_name}'"
+                else:
+                    response["status"] = "error"
+                    response["message"] = f"Target '{target_name}' failed with exit code {result.returncode}"
+
+                return response
+
+            except subprocess.TimeoutExpired as e:
+                # The killed process may still have printed the decisive diagnostic, so
+                # cache whatever was captured and expose it like a completed execution.
+                partial_stdout = _as_text(e.stdout)
+                partial_stderr = _as_text(e.stderr)
+                command_str = " ".join(cmd)
+                cached = self.output_cache.add(
+                    target=target_name,
+                    command=command_str,
+                    stdout=partial_stdout,
+                    stderr=partial_stderr,
+                    exit_code=-1,
+                )
+
+                return {
+                    "target": target_name,
+                    "command": command_str,
+                    "working_directory": str(config.working_dir),
+                    "status": "error",
+                    "message": f"Target '{target_name}' timed out after 5 minutes",
+                    "exit_code": -1,
+                    **_bounded_output_fields(partial_stdout, partial_stderr, config.tail_lines, cached.execution_id),
+                }
+            except subprocess.SubprocessError as e:
                 return {
                     "target": target_name,
                     "status": "error",
-                    "message": f"Invalid additional_args for target '{target_name}': {str(e)}",
+                    "message": f"Failed to execute target '{target_name}': {str(e)}",
                     "exit_code": -1,
                 }
-
-            arg_error = validate_additional_args(extra_args)
-            if arg_error is not None:
+            except Exception as e:
                 return {
                     "target": target_name,
                     "status": "error",
-                    "message": f"Rejected additional_args for target '{target_name}': {arg_error}",
+                    "message": f"Unexpected error executing target '{target_name}': {str(e)}",
                     "exit_code": -1,
                 }
 
-        try:
-            # Build the make command
-            cmd = ["make", "-C", str(WORKING_DIR), "-f", str(MAKEFILE_PATH), target_name]
-
-            if dry_run:
-                cmd.append("-n")  # Dry run flag for make
-
-            cmd.extend(extra_args)
-
-            # Execute the command - safe execution with list of args, no shell injection risk
-            result = subprocess.run(  # noqa: S603
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout
-            )
-
-            # Cache full output
-            command_str = " ".join(cmd)
-            cached = output_cache.add(
-                target=target_name,
-                command=command_str,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
-            )
-
-            response = {
-                "target": target_name,
-                "command": command_str,
-                "working_directory": str(WORKING_DIR),
-                "exit_code": result.returncode,
-                **_bounded_output_fields(result.stdout, result.stderr, cli_args.tail_lines, cached.execution_id),
-            }
-
-            if dry_run:
-                response["note"] = "This was a dry run - no commands were actually executed"
-
-            if result.returncode == 0:
-                response["status"] = "success"
-                response["message"] = f"Successfully executed target '{target_name}'"
-            else:
-                response["status"] = "error"
-                response["message"] = f"Target '{target_name}' failed with exit code {result.returncode}"
-
-            return response
-
-        except subprocess.TimeoutExpired as e:
-            # The killed process may still have printed the decisive diagnostic, so
-            # cache whatever was captured and expose it like a completed execution.
-            partial_stdout = _as_text(e.stdout)
-            partial_stderr = _as_text(e.stderr)
-            command_str = " ".join(cmd)
-            cached = output_cache.add(
-                target=target_name,
-                command=command_str,
-                stdout=partial_stdout,
-                stderr=partial_stderr,
-                exit_code=-1,
-            )
-
-            return {
-                "target": target_name,
-                "command": command_str,
-                "working_directory": str(WORKING_DIR),
-                "status": "error",
-                "message": f"Target '{target_name}' timed out after 5 minutes",
-                "exit_code": -1,
-                **_bounded_output_fields(partial_stdout, partial_stderr, cli_args.tail_lines, cached.execution_id),
-            }
-        except subprocess.SubprocessError as e:
-            return {
-                "target": target_name,
-                "status": "error",
-                "message": f"Failed to execute target '{target_name}': {str(e)}",
-                "exit_code": -1,
-            }
-        except Exception as e:
-            return {
-                "target": target_name,
-                "status": "error",
-                "message": f"Unexpected error executing target '{target_name}': {str(e)}",
-                "exit_code": -1,
-            }
-
-    # Set the function name and docstring dynamically
-    tool_name = make_tool_name(target_name)
-    make_target.__name__ = tool_name
-    make_target.__doc__ = f"{description}.\n\nExecutes: make -C {WORKING_DIR} -f {MAKEFILE_PATH} {target_name}"
-
-    # Register the tool with the MCP server
-    mcp_server.tool()(make_target)
-
-    return make_target
-
-
-def register_make_tools(targets: Dict[str, str]):
-    """Validate and register MCP tools for make targets."""
-    validate_tool_names(targets)
-    return [(target_name, create_make_tool(target_name, description)) for target_name, description in targets.items()]
-
-
-def list_available_targets() -> Dict[str, Any]:
-    """
-    List all available make targets that can be executed through this server.
-
-    Returns:
-        dict: Information about available targets and server configuration.
-    """
-    return {
-        "makefile_path": str(MAKEFILE_PATH),
-        "working_directory": str(WORKING_DIR),
-        "total_targets_in_makefile": (
-            len(MakefileParser(MAKEFILE_PATH).get_targets()) if MAKEFILE_PATH and MAKEFILE_PATH.exists() else 0
-        ),
-        "available_targets": len(filtered_targets),
-        "targets": [
-            {"name": name, "description": desc, "tool_name": make_tool_name(name)}
-            for name, desc in filtered_targets.items()
-        ],
-        "include_filter": list(INCLUDE_TARGETS) if INCLUDE_TARGETS else None,
-        "exclude_filter": list(EXCLUDE_TARGETS) if EXCLUDE_TARGETS else None,
-    }
-
-
-def get_makefile_info() -> Dict[str, Any]:
-    """
-    Get detailed information about the Makefile and its targets.
-
-    Returns:
-        dict: Comprehensive information about the Makefile.
-    """
-    all_targets = MakefileParser(MAKEFILE_PATH).get_targets() if MAKEFILE_PATH and MAKEFILE_PATH.exists() else {}
-
-    return {
-        "makefile_path": str(MAKEFILE_PATH),
-        "makefile_exists": MAKEFILE_PATH.exists(),
-        "working_directory": str(WORKING_DIR),
-        "all_targets": {
-            "count": len(all_targets),
-            "targets": [{"name": name, "description": desc} for name, desc in all_targets.items()],
-        },
-        "filtered_targets": {
-            "count": len(filtered_targets),
-            "targets": [{"name": name, "description": desc} for name, desc in filtered_targets.items()],
-        },
-        "filters": {
-            "include": list(INCLUDE_TARGETS) if INCLUDE_TARGETS else None,
-            "exclude": list(EXCLUDE_TARGETS) if EXCLUDE_TARGETS else None,
-        },
-    }
-
-
-def get_output(execution_id: int, stream: str = "stdout", start_line: int = 0, end_line: int = 100) -> Dict[str, Any]:
-    """
-    Retrieve a page of cached output from a previous make target execution.
-
-    Args:
-        execution_id: The execution ID returned by a make target tool.
-        stream: Which output stream to read — "stdout" or "stderr".
-        start_line: First line to return (0-indexed, inclusive).
-        end_line: Last line to return (exclusive).
-
-    Returns:
-        dict: The requested lines and metadata.
-    """
-    cached = output_cache.get(execution_id)
-    if cached is None:
-        return {
-            "status": "error",
-            "message": f"Execution ID {execution_id} not found in cache.",
-        }
-
-    if stream not in ("stdout", "stderr"):
-        return {
-            "status": "error",
-            "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
-        }
-
-    text = cached.stdout if stream == "stdout" else cached.stderr
-    lines = text.splitlines(keepends=True)
-    total_lines = len(lines)
-
-    # Clamp range
-    start_line = max(0, start_line)
-    end_line = max(start_line, min(end_line, total_lines))
-
-    selected = lines[start_line:end_line]
-
-    return {
-        "status": "success",
-        "execution_id": execution_id,
-        "target": cached.target,
-        "stream": stream,
-        "start_line": start_line,
-        "end_line": end_line,
-        "total_lines": total_lines,
-        "content": "".join(selected),
-    }
-
-
-def search_output(
-    execution_id: int,
-    pattern: str,
-    stream: str = "stdout",
-    context_lines: int = 3,
-    max_results: int = DEFAULT_MAX_SEARCH_RESULTS,
-) -> Dict[str, Any]:
-    """
-    Search cached output from a previous make target execution.
-
-    Args:
-        execution_id: The execution ID returned by a make target tool.
-        pattern: Non-empty substring to search for (case-insensitive, literal).
-        stream: Which output stream to search — "stdout" or "stderr".
-        context_lines: Number of surrounding lines to include with each match (>= 0).
-        max_results: Maximum number of matches to return (>= 1, defaults to
-            DEFAULT_MAX_SEARCH_RESULTS = 20). Every match is still counted in
-            total_matches; use get_output() around the returned line numbers to
-            read past the cap.
-
-    Returns:
-        dict: Matching lines with context and line numbers.
-    """
-    if not pattern:
-        return {
-            "status": "error",
-            "message": "Search pattern must not be empty. Provide a literal substring to search for.",
-        }
-
-    if context_lines < 0:
-        return {
-            "status": "error",
-            "message": f"Invalid context_lines {context_lines}. Must be 0 or greater.",
-        }
-
-    if max_results < 1:
-        return {
-            "status": "error",
-            "message": f"Invalid max_results {max_results}. Must be 1 or greater.",
-        }
-
-    cached = output_cache.get(execution_id)
-    if cached is None:
-        return {
-            "status": "error",
-            "message": f"Execution ID {execution_id} not found in cache.",
-        }
-
-    if stream not in ("stdout", "stderr"):
-        return {
-            "status": "error",
-            "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
-        }
-
-    text = cached.stdout if stream == "stdout" else cached.stderr
-    lines = text.splitlines()
-    total_lines = len(lines)
-    pattern_lower = pattern.lower()
-
-    # Find matching line indices
-    match_indices = [i for i, line in enumerate(lines) if pattern_lower in line.lower()]
-    total_matches = len(match_indices)
-
-    # Build matches with context, bounded to the first max_results matches so one
-    # response cannot repeat a context window for every line of a large log.
-    matches: List[Dict[str, Any]] = []
-    for idx in match_indices[:max_results]:
-        ctx_start = max(0, idx - context_lines)
-        ctx_end = min(total_lines, idx + context_lines + 1)
-        context = [{"line_number": i, "text": lines[i], "is_match": i == idx} for i in range(ctx_start, ctx_end)]
-        matches.append(
-            {
-                "line_number": idx,
-                "text": lines[idx],
-                "context": context,
-            }
+        # Set the function name and docstring dynamically
+        tool_name = make_tool_name(target_name)
+        make_target.__name__ = tool_name
+        make_target.__doc__ = (
+            f"{description}.\n\nExecutes: make -C {config.working_dir} -f {config.makefile_path} {target_name}"
         )
 
-    result: Dict[str, Any] = {
-        "status": "success",
-        "execution_id": execution_id,
-        "target": cached.target,
-        "stream": stream,
-        "pattern": pattern,
-        "total_lines": total_lines,
-        "total_matches": total_matches,
-        "returned_matches": len(matches),
-        "max_results": max_results,
-        "truncated": total_matches > len(matches),
-        "matches": matches,
-    }
+        # Register the tool with the MCP server
+        self.mcp_server.tool()(make_target)
 
-    if result["truncated"]:
-        result["truncation_note"] = (
-            f"Returned the first {len(matches)} of {total_matches} matches. "
-            "Narrow the pattern, raise max_results, or use "
-            f"get_output(execution_id={execution_id}) around the returned line numbers."
-        )
+        return make_target
 
-    return result
+    def register_make_tools(self) -> List[tuple[str, str]]:
+        """Validate and register MCP tools for the discovered make targets."""
+        validate_tool_names(self.filtered_targets)
+        return [
+            (target_name, self.create_make_tool(target_name, description))
+            for target_name, description in self.filtered_targets.items()
+        ]
+
+    def list_available_targets(self) -> Dict[str, Any]:
+        """
+        List all available make targets that can be executed through this server.
+
+        Returns:
+            dict: Information about available targets and server configuration.
+        """
+        config = self.config
+        return {
+            "makefile_path": str(config.makefile_path),
+            "working_directory": str(config.working_dir),
+            "total_targets_in_makefile": (
+                len(MakefileParser(config.makefile_path).get_targets()) if config.makefile_path.exists() else 0
+            ),
+            "available_targets": len(self.filtered_targets),
+            "targets": [
+                {"name": name, "description": desc, "tool_name": make_tool_name(name)}
+                for name, desc in self.filtered_targets.items()
+            ],
+            "include_filter": list(config.include_targets) if config.include_targets else None,
+            "exclude_filter": list(config.exclude_targets) if config.exclude_targets else None,
+        }
+
+    def get_makefile_info(self) -> Dict[str, Any]:
+        """
+        Get detailed information about the Makefile and its targets.
+
+        Returns:
+            dict: Comprehensive information about the Makefile.
+        """
+        config = self.config
+        all_targets = MakefileParser(config.makefile_path).get_targets() if config.makefile_path.exists() else {}
+
+        return {
+            "makefile_path": str(config.makefile_path),
+            "makefile_exists": config.makefile_path.exists(),
+            "working_directory": str(config.working_dir),
+            "all_targets": {
+                "count": len(all_targets),
+                "targets": [{"name": name, "description": desc} for name, desc in all_targets.items()],
+            },
+            "filtered_targets": {
+                "count": len(self.filtered_targets),
+                "targets": [{"name": name, "description": desc} for name, desc in self.filtered_targets.items()],
+            },
+            "filters": {
+                "include": list(config.include_targets) if config.include_targets else None,
+                "exclude": list(config.exclude_targets) if config.exclude_targets else None,
+            },
+        }
+
+    def get_output(
+        self, execution_id: int, stream: str = "stdout", start_line: int = 0, end_line: int = 100
+    ) -> Dict[str, Any]:
+        """
+        Retrieve a page of cached output from a previous make target execution.
+
+        Args:
+            execution_id: The execution ID returned by a make target tool.
+            stream: Which output stream to read — "stdout" or "stderr".
+            start_line: First line to return (0-indexed, inclusive).
+            end_line: Last line to return (exclusive).
+
+        Returns:
+            dict: The requested lines and metadata.
+        """
+        cached = self.output_cache.get(execution_id)
+        if cached is None:
+            return {
+                "status": "error",
+                "message": f"Execution ID {execution_id} not found in cache.",
+            }
+
+        if stream not in ("stdout", "stderr"):
+            return {
+                "status": "error",
+                "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
+            }
+
+        text = cached.stdout if stream == "stdout" else cached.stderr
+        lines = text.splitlines(keepends=True)
+        total_lines = len(lines)
+
+        # Clamp range
+        start_line = max(0, start_line)
+        end_line = max(start_line, min(end_line, total_lines))
+
+        selected = lines[start_line:end_line]
+
+        return {
+            "status": "success",
+            "execution_id": execution_id,
+            "target": cached.target,
+            "stream": stream,
+            "start_line": start_line,
+            "end_line": end_line,
+            "total_lines": total_lines,
+            "content": "".join(selected),
+        }
+
+    def search_output(
+        self,
+        execution_id: int,
+        pattern: str,
+        stream: str = "stdout",
+        context_lines: int = 3,
+        max_results: int = DEFAULT_MAX_SEARCH_RESULTS,
+    ) -> Dict[str, Any]:
+        """
+        Search cached output from a previous make target execution.
+
+        Args:
+            execution_id: The execution ID returned by a make target tool.
+            pattern: Non-empty substring to search for (case-insensitive, literal).
+            stream: Which output stream to search — "stdout" or "stderr".
+            context_lines: Number of surrounding lines to include with each match (>= 0).
+            max_results: Maximum number of matches to return (>= 1, defaults to
+                DEFAULT_MAX_SEARCH_RESULTS = 20). Every match is still counted in
+                total_matches; use get_output() around the returned line numbers to
+                read past the cap.
+
+        Returns:
+            dict: Matching lines with context and line numbers.
+        """
+        if not pattern:
+            return {
+                "status": "error",
+                "message": "Search pattern must not be empty. Provide a literal substring to search for.",
+            }
+
+        if context_lines < 0:
+            return {
+                "status": "error",
+                "message": f"Invalid context_lines {context_lines}. Must be 0 or greater.",
+            }
+
+        if max_results < 1:
+            return {
+                "status": "error",
+                "message": f"Invalid max_results {max_results}. Must be 1 or greater.",
+            }
+
+        cached = self.output_cache.get(execution_id)
+        if cached is None:
+            return {
+                "status": "error",
+                "message": f"Execution ID {execution_id} not found in cache.",
+            }
+
+        if stream not in ("stdout", "stderr"):
+            return {
+                "status": "error",
+                "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
+            }
+
+        text = cached.stdout if stream == "stdout" else cached.stderr
+        lines = text.splitlines()
+        total_lines = len(lines)
+        pattern_lower = pattern.lower()
+
+        # Find matching line indices
+        match_indices = [i for i, line in enumerate(lines) if pattern_lower in line.lower()]
+        total_matches = len(match_indices)
+
+        # Build matches with context, bounded to the first max_results matches so one
+        # response cannot repeat a context window for every line of a large log.
+        matches: List[Dict[str, Any]] = []
+        for idx in match_indices[:max_results]:
+            ctx_start = max(0, idx - context_lines)
+            ctx_end = min(total_lines, idx + context_lines + 1)
+            context = [{"line_number": i, "text": lines[i], "is_match": i == idx} for i in range(ctx_start, ctx_end)]
+            matches.append(
+                {
+                    "line_number": idx,
+                    "text": lines[idx],
+                    "context": context,
+                }
+            )
+
+        result: Dict[str, Any] = {
+            "status": "success",
+            "execution_id": execution_id,
+            "target": cached.target,
+            "stream": stream,
+            "pattern": pattern,
+            "total_lines": total_lines,
+            "total_matches": total_matches,
+            "returned_matches": len(matches),
+            "max_results": max_results,
+            "truncated": total_matches > len(matches),
+            "matches": matches,
+        }
+
+        if result["truncated"]:
+            result["truncation_note"] = (
+                f"Returned the first {len(matches)} of {total_matches} matches. "
+                "Narrow the pattern, raise max_results, or use "
+                f"get_output(execution_id={execution_id}) around the returned line numbers."
+            )
+
+        return result
 
 
-# Register utility tools with MCP server
-mcp_server.tool()(list_available_targets)
-mcp_server.tool()(get_makefile_info)
-mcp_server.tool()(get_output)
-mcp_server.tool()(search_output)
+def initialize_makefile_mcp(argv: Optional[List[str]] = None) -> MakefileServer:
+    """Initialize the makefile MCP server: the only place server state is created.
 
+    Parses arguments (sys.argv by default), validates the resolved paths, and
+    builds a server with every tool — the four utilities plus one per discovered
+    make target — registered on its own FastMCP instance. Exits the process when
+    the configuration is invalid or the targets cannot be exposed as tools, the
+    same way argparse exits on bad arguments. Importing this module performs
+    none of this work.
+    """
+    config = build_config(parse_cli_args(argv))
 
-def main():
-    """Entry point for the Makefile MCP server."""
-    global filtered_targets, cli_args, INCLUDE_TARGETS, EXCLUDE_TARGETS, output_cache
+    if not config.makefile_path.exists():
+        print(f"Error: Makefile not found at {config.makefile_path}", file=sys.stderr)
+        sys.exit(1)
 
-    cli_args = initialize_makefile_mcp()
+    if not config.working_dir.is_dir():
+        print(f"Error: Working directory not found: {config.working_dir}", file=sys.stderr)
+        sys.exit(1)
 
-    INCLUDE_TARGETS = None
-    if cli_args.include:
-        INCLUDE_TARGETS = {target.strip() for target in cli_args.include.split(",")}
-    EXCLUDE_TARGETS = set()
-    if cli_args.exclude:
-        EXCLUDE_TARGETS = {target.strip() for target in cli_args.exclude.split(",")}
+    server = MakefileServer(config)
 
-    output_cache = OutputCache(max_entries=cli_args.max_cached_executions)
-
-    filtered_targets = get_makefile_targets()
-
-    if not filtered_targets:
+    if not server.filtered_targets:
         print("Error: No make targets available to expose as tools", file=sys.stderr)
         sys.exit(1)
 
     try:
-        register_make_tools(filtered_targets)
+        server.register_make_tools()
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    return server
+
+
+def main(argv: Optional[List[str]] = None) -> MakefileServer:
+    """Entry point for the Makefile MCP server. Returns the initialized server."""
+    server = initialize_makefile_mcp(argv)
+
     print("Starting Makefile MCP server", file=sys.stderr)
-    print(f"  Makefile: {MAKEFILE_PATH}", file=sys.stderr)
-    print(f"  Working directory: {WORKING_DIR}", file=sys.stderr)
-    print(f"  Available targets: {', '.join(filtered_targets.keys())}", file=sys.stderr)
+    print(f"  Makefile: {server.config.makefile_path}", file=sys.stderr)
+    print(f"  Working directory: {server.config.working_dir}", file=sys.stderr)
+    print(f"  Available targets: {', '.join(server.filtered_targets.keys())}", file=sys.stderr)
 
-    if INCLUDE_TARGETS:
-        print(f"  Include filter: {', '.join(INCLUDE_TARGETS)}", file=sys.stderr)
-    if EXCLUDE_TARGETS:
-        print(f"  Exclude filter: {', '.join(EXCLUDE_TARGETS)}", file=sys.stderr)
+    if server.config.include_targets:
+        print(f"  Include filter: {', '.join(server.config.include_targets)}", file=sys.stderr)
+    if server.config.exclude_targets:
+        print(f"  Exclude filter: {', '.join(server.config.exclude_targets)}", file=sys.stderr)
 
-    mcp_server.run()
+    server.mcp_server.run()
+    return server
 
 
 if __name__ == "__main__":

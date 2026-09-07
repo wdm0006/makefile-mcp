@@ -3,9 +3,15 @@
 Comprehensive test suite for the Makefile MCP Server
 
 Tests Makefile parsing, target filtering, tool creation, and command execution.
+
+Every server in this suite is built through explicit initialization
+(initialize_makefile_mcp), which returns an independent MakefileServer. There is
+no module-level state to reset, so no test deletes the module from sys.modules
+or reimports it to isolate itself.
 """
 
 import contextlib
+import dataclasses
 import os
 import pathlib
 import re
@@ -13,7 +19,8 @@ import runpy
 import shutil
 import subprocess
 
-# Import the makefile MCP components
+# Import the makefile MCP components once: importing the module has no side
+# effects, so a single top-level import is safe to share across all tests.
 import sys
 import tempfile
 import threading
@@ -22,6 +29,42 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import makefile_mcp  # noqa: E402
+
+THREE_TARGET_MAKEFILE = """# Build the project
+build:
+\techo "Building project..."
+
+# Run tests
+test:
+\techo "Running tests..."
+
+# Clean up
+clean:
+\techo "Cleaning up..."
+
+.PHONY: build test clean
+"""
+
+
+@pytest.fixture
+def server_factory(tmp_path):
+    """Create fresh servers through explicit initialization.
+
+    This replaces the old reset pattern, which deleted makefile_mcp from
+    sys.modules and reimported it under a patched sys.argv to rebuild
+    import-time globals. Each call builds a new MakefileServer with its own
+    FastMCP instance, output cache, and discovered targets, so nothing leaks
+    between tests — and no module reloading is involved.
+    """
+
+    def _create(makefile_text=THREE_TARGET_MAKEFILE, extra_args=()):
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text(makefile_text)
+        return makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile_path), *extra_args])
+
+    return _create
 
 
 class TestMakefileParser:
@@ -33,15 +76,15 @@ class TestMakefileParser:
 
         makefile_content = """# Build the project
 build:
-	echo "Building..."
+\techo "Building..."
 
 # Run tests
 test:
-	pytest
+\tpytest
 
 # Clean up build artifacts
 clean:
-	rm -rf build/
+\trm -rf build/
 
 .PHONY: build test clean
 """
@@ -70,14 +113,14 @@ clean:
         from makefile_mcp import MakefileParser
 
         makefile_content = """build:
-	echo "Building..."
+\techo "Building..."
 
 # This is a test target
 test:
-	pytest
+\tpytest
 
 install:
-	pip install -e .
+\tpip install -e .
 """
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
@@ -103,13 +146,13 @@ install:
 .DEFAULT_GOAL := all
 
 all:
-	echo "All"
+\techo "All"
 
 %.o: %.c
-	gcc -c $< -o $@
+\tgcc -c $< -o $@
 
 clean:
-	rm -f *.o
+\trm -f *.o
 
 .SUFFIXES: .c .o
 """
@@ -384,68 +427,31 @@ CONFIG := build
 class TestMakefileMCPServer:
     """Test the MCP server functionality."""
 
-    @pytest.fixture
-    def test_makefile(self):
-        """Create a test Makefile for testing."""
-        makefile_content = """# Build the project
-build:
-\techo "Building project..."
-
-# Run tests
-test:
-\techo "Running tests..."
-
-# Clean up
-clean:
-\techo "Cleaning up..."
-
-.PHONY: build test clean
-"""
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
-            f.write(makefile_content)
-            f.flush()  # Ensure content is written to disk
-            yield f.name
-
-        os.unlink(f.name)
-
-    def test_make_tool_creation(self, test_makefile):
+    def test_make_tool_creation(self, server_factory):
         """Test that make tools are created correctly."""
-        # Mock the CLI args and reimport
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            # Clear the module cache
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        # Initialization discovered the Makefile's targets
+        assert len(server.filtered_targets) == 3
+        assert "build" in server.filtered_targets
+        assert "test" in server.filtered_targets
+        assert "clean" in server.filtered_targets
 
-            # Manually trigger target parsing with the test makefile
-            makefile_mcp.MAKEFILE_PATH = pathlib.Path(test_makefile)
-            makefile_mcp.WORKING_DIR = pathlib.Path(test_makefile).parent
-            makefile_mcp.INCLUDE_TARGETS = None  # Include all targets
-            makefile_mcp.EXCLUDE_TARGETS = set()  # Exclude nothing
-            makefile_mcp.filtered_targets = makefile_mcp.get_makefile_targets()
+    def test_server_config_is_immutable(self, server_factory):
+        """The resolved configuration cannot be mutated after initialization."""
+        server = server_factory()
 
-            # Check that targets were parsed
-            assert len(makefile_mcp.filtered_targets) == 3
-            assert "build" in makefile_mcp.filtered_targets
-            assert "test" in makefile_mcp.filtered_targets
-            assert "clean" in makefile_mcp.filtered_targets
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            server.config.makefile_path = pathlib.Path("/somewhere/else/Makefile")
 
     def test_startup_rejects_colliding_tool_names(self, tmp_path, capsys):
         """Startup rejects targets that normalize to the same tool name."""
         makefile_path = tmp_path / "Makefile"
         makefile_path.write_text("foo-bar:\n\techo hyphen\n\nfoo.bar:\n\techo period\n")
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", str(makefile_path)]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            with patch.object(makefile_mcp, "create_make_tool") as create_make_tool:
-                with pytest.raises(SystemExit) as exc_info:
-                    makefile_mcp.main()
+        with patch.object(makefile_mcp.MakefileServer, "create_make_tool") as create_make_tool:
+            with pytest.raises(SystemExit) as exc_info:
+                makefile_mcp.main(["--makefile", str(makefile_path)])
 
         assert exc_info.value.code == 1
         create_make_tool.assert_not_called()
@@ -459,23 +465,8 @@ clean:
         makefile_path = tmp_path / "Makefile"
         makefile_path.write_text("build:\n\techo build\n\ntest:\n\techo test\n")
 
-        argv = [
-            "makefile_mcp.py",
-            "--makefile",
-            str(makefile_path),
-            "--include",
-            "build,test",
-            "--exclude",
-            "test",
-        ]
-        with patch("sys.argv", argv):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            with patch.object(makefile_mcp.mcp_server, "run") as run:
-                makefile_mcp.main()
+        with patch.object(makefile_mcp.FastMCP, "run") as run:
+            makefile_mcp.main(["--makefile", str(makefile_path), "--include", "build,test", "--exclude", "test"])
 
         captured = capsys.readouterr()
         assert captured.out == ""
@@ -488,23 +479,20 @@ clean:
         assert "Exclude filter: test" in captured.err
         run.assert_called_once_with()
 
-    def test_tool_name_normalization_is_shared(self, test_makefile):
+    def test_tool_name_normalization_is_shared(self, tmp_path):
         """Registration and target metadata use the same name generator."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        makefile_path = tmp_path / "Makefile"
+        makefile_path.write_text("# Coverage\ntest-coverage.xml:\n\techo coverage\n")
 
-            import makefile_mcp
-
-            makefile_mcp.filtered_targets = {"test-coverage.xml": "Coverage"}
-            tool = makefile_mcp.create_make_tool("test-coverage.xml", "Coverage")
-            listed_target = makefile_mcp.list_available_targets()["targets"][0]
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile_path)])
+        tool = server.create_make_tool("test-coverage.xml", "Coverage")
+        listed_target = server.list_available_targets()["targets"][0]
 
         assert tool.__name__ == "make_test_coverage_xml"
         assert listed_target["tool_name"] == tool.__name__
 
     @patch("subprocess.run")
-    def test_make_tool_execution_success(self, mock_run, test_makefile):
+    def test_make_tool_execution_success(self, mock_run, server_factory):
         """Test successful execution of a make target."""
         # Mock successful subprocess execution
         mock_result = MagicMock()
@@ -513,35 +501,31 @@ clean:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        # Create a make tool for testing
+        make_tool = server.create_make_tool("build", "Build the project")
 
-            # Create a make tool for testing
-            make_tool = makefile_mcp.create_make_tool("build", "Build the project")
+        # Execute the tool
+        result = make_tool()
 
-            # Execute the tool
-            result = make_tool()
+        assert result["status"] == "success"
+        assert result["target"] == "build"
+        assert result["exit_code"] == 0
+        assert result["stdout_tail"] == "Building project...\n"
+        assert result["execution_id"] >= 1
+        assert result["stdout_total_lines"] == 1
+        assert result["stdout_total_chars"] == len("Building project...\n")
+        assert "Successfully executed target 'build'" in result["message"]
 
-            assert result["status"] == "success"
-            assert result["target"] == "build"
-            assert result["exit_code"] == 0
-            assert result["stdout_tail"] == "Building project...\n"
-            assert result["execution_id"] >= 1
-            assert result["stdout_total_lines"] == 1
-            assert result["stdout_total_chars"] == len("Building project...\n")
-            assert "Successfully executed target 'build'" in result["message"]
-
-            # Verify subprocess was called correctly
-            mock_run.assert_called_once()
-            call_args = mock_run.call_args[0][0]
-            assert "make" in call_args
-            assert "build" in call_args
+        # Verify subprocess was called correctly
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "make" in call_args
+        assert "build" in call_args
 
     @patch("subprocess.run")
-    def test_make_tool_execution_failure(self, mock_run, test_makefile):
+    def test_make_tool_execution_failure(self, mock_run, server_factory):
         """Test failed execution of a make target."""
         # Mock failed subprocess execution
         mock_result = MagicMock()
@@ -550,19 +534,15 @@ clean:
         mock_result.stderr = "make: *** No rule to make target 'invalid'. Stop.\n"
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("invalid", "Invalid target")
+        result = make_tool()
 
-            make_tool = makefile_mcp.create_make_tool("invalid", "Invalid target")
-            result = make_tool()
-
-            assert result["status"] == "error"
-            assert result["target"] == "invalid"
-            assert result["exit_code"] == 2
-            assert "failed with exit code 2" in result["message"]
+        assert result["status"] == "error"
+        assert result["target"] == "invalid"
+        assert result["exit_code"] == 2
+        assert "failed with exit code 2" in result["message"]
 
     @patch("subprocess.run")
     def test_make_tool_uses_custom_makefile(self, mock_run, tmp_path):
@@ -576,30 +556,18 @@ clean:
         mock_result = MagicMock(returncode=0, stdout="custom\n", stderr="")
         mock_run.return_value = mock_result
 
-        with patch(
-            "sys.argv",
-            [
-                "makefile_mcp.py",
-                "--makefile",
-                str(custom_makefile),
-                "--working-dir",
-                str(working_dir),
-            ],
-        ):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            make_tool = makefile_mcp.create_make_tool("custom", "Run custom target")
-            result = make_tool()
+        server = makefile_mcp.initialize_makefile_mcp(
+            ["--makefile", str(custom_makefile), "--working-dir", str(working_dir)]
+        )
+        make_tool = server.create_make_tool("custom", "Run custom target")
+        result = make_tool()
 
         expected_command = ["make", "-C", str(working_dir), "-f", str(custom_makefile), "custom"]
         mock_run.assert_called_once_with(expected_command, capture_output=True, text=True, timeout=300)
         assert result["command"] == " ".join(expected_command)
 
     @patch("subprocess.run")
-    def test_make_tool_dry_run(self, mock_run, test_makefile):
+    def test_make_tool_dry_run(self, mock_run, server_factory):
         """Test dry run execution of a make target."""
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -607,24 +575,20 @@ clean:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("build", "Build the project")
+        result = make_tool(dry_run=True)
 
-            make_tool = makefile_mcp.create_make_tool("build", "Build the project")
-            result = make_tool(dry_run=True)
+        assert result["status"] == "success"
+        assert result["note"] == "This was a dry run - no commands were actually executed"
 
-            assert result["status"] == "success"
-            assert result["note"] == "This was a dry run - no commands were actually executed"
-
-            # Verify -n flag was added for dry run
-            call_args = mock_run.call_args[0][0]
-            assert "-n" in call_args
+        # Verify -n flag was added for dry run
+        call_args = mock_run.call_args[0][0]
+        assert "-n" in call_args
 
     @patch("subprocess.run")
-    def test_make_tool_with_additional_args(self, mock_run, test_makefile):
+    def test_make_tool_with_additional_args(self, mock_run, server_factory):
         """Test make tool execution with additional arguments."""
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -632,56 +596,44 @@ clean:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("test", "Run tests")
+        result = make_tool(additional_args="-j4 VERBOSE=1")
 
-            make_tool = makefile_mcp.create_make_tool("test", "Run tests")
-            result = make_tool(additional_args="-j4 VERBOSE=1")
+        assert result["status"] == "success"
 
-            assert result["status"] == "success"
-
-            call_args = mock_run.call_args[0][0]
-            assert call_args[-2:] == ["-j4", "VERBOSE=1"]
+        call_args = mock_run.call_args[0][0]
+        assert call_args[-2:] == ["-j4", "VERBOSE=1"]
 
     @patch("subprocess.run")
-    def test_make_tool_additional_args_preserve_quoting(self, mock_run, test_makefile):
+    def test_make_tool_additional_args_preserve_quoting(self, mock_run, server_factory):
         """Quoted values and escaped spaces stay a single argument."""
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("test", "Run tests")
+        result = make_tool(additional_args='MESSAGE="hello world" PATH_ARG=my\\ file.txt -j4')
 
-            make_tool = makefile_mcp.create_make_tool("test", "Run tests")
-            result = make_tool(additional_args='MESSAGE="hello world" PATH_ARG=my\\ file.txt -j4')
+        assert result["status"] == "success"
 
-            assert result["status"] == "success"
-
-            call_args = mock_run.call_args[0][0]
-            assert call_args[-3:] == ["MESSAGE=hello world", "PATH_ARG=my file.txt", "-j4"]
+        call_args = mock_run.call_args[0][0]
+        assert call_args[-3:] == ["MESSAGE=hello world", "PATH_ARG=my file.txt", "-j4"]
 
     @patch("subprocess.run")
-    def test_make_tool_invalid_additional_args(self, mock_run, test_makefile):
+    def test_make_tool_invalid_additional_args(self, mock_run, server_factory):
         """Malformed quoting is reported as an error without invoking make."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("test", "Run tests")
+        result = make_tool(additional_args='MESSAGE="unclosed')
 
-            make_tool = makefile_mcp.create_make_tool("test", "Run tests")
-            result = make_tool(additional_args='MESSAGE="unclosed')
-
-            assert result["status"] == "error"
-            assert result["target"] == "test"
-            assert result["exit_code"] == -1
-            assert "Invalid additional_args" in result["message"]
-            mock_run.assert_not_called()
+        assert result["status"] == "error"
+        assert result["target"] == "test"
+        assert result["exit_code"] == -1
+        assert "Invalid additional_args" in result["message"]
+        mock_run.assert_not_called()
 
     @pytest.mark.parametrize(
         "additional_args",
@@ -711,22 +663,18 @@ clean:
         ],
     )
     @patch("subprocess.run")
-    def test_make_tool_rejects_boundary_bypass_args(self, mock_run, additional_args, test_makefile):
+    def test_make_tool_rejects_boundary_bypass_args(self, mock_run, additional_args, server_factory):
         """Target/makefile/directory/eval bypass attempts never reach subprocess.run."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("safe", "Run the safe target")
+        result = make_tool(additional_args=additional_args)
 
-            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
-            result = make_tool(additional_args=additional_args)
-
-            assert result["status"] == "error"
-            assert result["target"] == "safe"
-            assert result["exit_code"] == -1
-            assert "Rejected additional_args" in result["message"]
-            mock_run.assert_not_called()
+        assert result["status"] == "error"
+        assert result["target"] == "safe"
+        assert result["exit_code"] == -1
+        assert "Rejected additional_args" in result["message"]
+        mock_run.assert_not_called()
 
     @pytest.mark.parametrize(
         ("additional_args", "expected_tail"),
@@ -745,23 +693,19 @@ clean:
         ],
     )
     @patch("subprocess.run")
-    def test_make_tool_accepts_safe_args(self, mock_run, additional_args, expected_tail, test_makefile):
+    def test_make_tool_accepts_safe_args(self, mock_run, additional_args, expected_tail, server_factory):
         """Safe execution flags and variable assignments still reach make unchanged."""
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("safe", "Run the safe target")
+        result = make_tool(additional_args=additional_args)
 
-            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
-            result = make_tool(additional_args=additional_args)
+        assert result["status"] == "success"
 
-            assert result["status"] == "success"
-
-            call_args = mock_run.call_args[0][0]
-            assert call_args[-len(expected_tail) :] == expected_tail
+        call_args = mock_run.call_args[0][0]
+        assert call_args[-len(expected_tail) :] == expected_tail
 
     @pytest.mark.parametrize(
         ("additional_args", "expected_fragment"),
@@ -772,74 +716,48 @@ clean:
         ],
     )
     @patch("subprocess.run")
-    def test_make_tool_rejection_names_the_expansion(self, mock_run, additional_args, expected_fragment, test_makefile):
+    def test_make_tool_rejection_names_the_expansion(
+        self, mock_run, additional_args, expected_fragment, server_factory
+    ):
         """The rejection is specific, not the closure's generic unexpected-error fallback."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
 
-            import makefile_mcp
+        make_tool = server.create_make_tool("safe", "Run the safe target")
+        result = make_tool(additional_args=additional_args)
 
-            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
-            result = make_tool(additional_args=additional_args)
+        assert result["status"] == "error"
+        assert result["exit_code"] == -1
+        assert "Rejected additional_args" in result["message"]
+        assert expected_fragment in result["message"]
+        assert "Unexpected error" not in result["message"]
+        mock_run.assert_not_called()
 
-            assert result["status"] == "error"
-            assert result["exit_code"] == -1
-            assert "Rejected additional_args" in result["message"]
-            assert expected_fragment in result["message"]
-            assert "Unexpected error" not in result["message"]
-            mock_run.assert_not_called()
-
-    def test_list_available_targets_tool(self, test_makefile):
+    def test_list_available_targets_tool(self, server_factory):
         """Test the list_available_targets tool."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
+        result = server.list_available_targets()
 
-            import makefile_mcp
+        assert "makefile_path" in result
+        assert "working_directory" in result
+        assert "available_targets" in result
+        assert result["available_targets"] == 3
+        assert "targets" in result
 
-            # Manually trigger target parsing with the test makefile
-            makefile_mcp.MAKEFILE_PATH = pathlib.Path(test_makefile)
-            makefile_mcp.WORKING_DIR = pathlib.Path(test_makefile).parent
-            makefile_mcp.INCLUDE_TARGETS = None  # Include all targets
-            makefile_mcp.EXCLUDE_TARGETS = set()  # Exclude nothing
-            makefile_mcp.filtered_targets = makefile_mcp.get_makefile_targets()
+        target_names = [t["name"] for t in result["targets"]]
+        assert "build" in target_names
+        assert "test" in target_names
+        assert "clean" in target_names
 
-            result = makefile_mcp.list_available_targets()
-
-            assert "makefile_path" in result
-            assert "working_directory" in result
-            assert "available_targets" in result
-            assert result["available_targets"] == 3
-            assert "targets" in result
-
-            target_names = [t["name"] for t in result["targets"]]
-            assert "build" in target_names
-            assert "test" in target_names
-            assert "clean" in target_names
-
-    def test_get_makefile_info_tool(self, test_makefile):
+    def test_get_makefile_info_tool(self, server_factory):
         """Test the get_makefile_info tool."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", test_makefile]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        server = server_factory()
+        result = server.get_makefile_info()
 
-            import makefile_mcp
-
-            # Manually trigger target parsing with the test makefile
-            makefile_mcp.MAKEFILE_PATH = pathlib.Path(test_makefile)
-            makefile_mcp.WORKING_DIR = pathlib.Path(test_makefile).parent
-            makefile_mcp.INCLUDE_TARGETS = None  # Include all targets
-            makefile_mcp.EXCLUDE_TARGETS = set()  # Exclude nothing
-            makefile_mcp.filtered_targets = makefile_mcp.get_makefile_targets()
-
-            result = makefile_mcp.get_makefile_info()
-
-            assert result["makefile_exists"] is True
-            assert result["all_targets"]["count"] == 3
-            assert result["filtered_targets"]["count"] == 3
-            assert result["filters"]["include"] is None
-            assert result["filters"]["exclude"] is None
+        assert result["makefile_exists"] is True
+        assert result["all_targets"]["count"] == 3
+        assert result["filtered_targets"]["count"] == 3
+        assert result["filters"]["include"] is None
+        assert result["filters"]["exclude"] is None
 
 
 class TestCommandLineArguments:
@@ -847,76 +765,36 @@ class TestCommandLineArguments:
 
     def test_include_filter(self):
         """Test --include command line argument."""
-        test_args = ["makefile_mcp.py", "--include", "build,test"]
+        args = makefile_mcp.parse_cli_args(["--include", "build,test"])
 
-        with patch("sys.argv", test_args):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            # Just test the arg parsing function directly
-            from makefile_mcp import parse_cli_args
-
-            args = parse_cli_args()
-
-            assert args.include == "build,test"
-            assert args.exclude is None
+        assert args.include == "build,test"
+        assert args.exclude is None
 
     def test_exclude_filter(self):
         """Test --exclude command line argument."""
-        test_args = ["makefile_mcp.py", "--exclude", "clean,deploy"]
+        args = makefile_mcp.parse_cli_args(["--exclude", "clean,deploy"])
 
-        with patch("sys.argv", test_args):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            from makefile_mcp import parse_cli_args
-
-            args = parse_cli_args()
-
-            assert args.exclude == "clean,deploy"
-            assert args.include is None
+        assert args.exclude == "clean,deploy"
+        assert args.include is None
 
     def test_custom_makefile_path(self):
         """Test --makefile command line argument."""
-        test_args = ["makefile_mcp.py", "--makefile", "/custom/path/Makefile"]
+        args = makefile_mcp.parse_cli_args(["--makefile", "/custom/path/Makefile"])
 
-        with patch("sys.argv", test_args):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            from makefile_mcp import parse_cli_args
-
-            args = parse_cli_args()
-
-            assert args.makefile == "/custom/path/Makefile"
+        assert args.makefile == "/custom/path/Makefile"
 
     def test_working_directory(self):
         """Test --working-dir command line argument."""
-        test_args = ["makefile_mcp.py", "--working-dir", "/custom/work/dir"]
+        args = makefile_mcp.parse_cli_args(["--working-dir", "/custom/work/dir"])
 
-        with patch("sys.argv", test_args):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            from makefile_mcp import parse_cli_args
-
-            args = parse_cli_args()
-
-            assert args.working_dir == "/custom/work/dir"
+        assert args.working_dir == "/custom/work/dir"
 
     @pytest.mark.parametrize("option", ["--max-cached-executions", "--tail-lines"])
     @pytest.mark.parametrize("value", ["0", "-1"])
     def test_output_limits_must_be_positive(self, option, value, capsys):
         """Test output limits reject zero and negative values."""
-        with patch("sys.argv", ["makefile_mcp.py"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            from makefile_mcp import parse_cli_args
-
-        with patch("sys.argv", ["makefile_mcp.py", option, value]):
-            with pytest.raises(SystemExit) as exc_info:
-                parse_cli_args()
+        with pytest.raises(SystemExit) as exc_info:
+            makefile_mcp.parse_cli_args([option, value])
 
         assert exc_info.value.code == 2
         error = capsys.readouterr().err
@@ -925,28 +803,27 @@ class TestCommandLineArguments:
 
     def test_positive_output_limits_are_accepted(self):
         """Test positive custom output limits are preserved."""
-        test_args = ["makefile_mcp.py", "--max-cached-executions", "3", "--tail-lines", "5"]
-
-        with patch("sys.argv", test_args):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            from makefile_mcp import parse_cli_args
-
-            args = parse_cli_args()
+        args = makefile_mcp.parse_cli_args(["--max-cached-executions", "3", "--tail-lines", "5"])
 
         assert args.max_cached_executions == 3
         assert args.tail_lines == 5
 
     def test_import_tolerates_host_process_arguments(self):
-        """Importing the module ignores arguments owned by the host process."""
-        with patch("sys.argv", ["host-process", "--host-option", "value"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        """Executing the module without running main() ignores host-process arguments.
 
-            import makefile_mcp
+        runpy re-executes the file under a non-__main__ name to observe the import
+        contract itself; no test resets state this way — state is built by calling
+        initialize_makefile_mcp(). The re-execution must parse no arguments and
+        leave no module-level state behind.
+        """
+        argv = ["host-process", "--host-option", "value", "--makefile", "/nonexistent/Makefile"]
+        module_path = pathlib.Path(__file__).resolve().parent.parent / "makefile_mcp.py"
+        with patch("sys.argv", argv):
+            module_globals = runpy.run_path(str(module_path), run_name="makefile_mcp_import")
 
-        assert makefile_mcp.cli_args.makefile == "Makefile"
+        assert "cli_args" not in module_globals
+        assert "output_cache" not in module_globals
+        assert "filtered_targets" not in module_globals
 
     @pytest.mark.parametrize(
         "command",
@@ -974,76 +851,44 @@ class TestErrorHandling:
     """Test error handling scenarios."""
 
     @patch("subprocess.run")
-    def test_subprocess_timeout(self, mock_run):
+    def test_subprocess_timeout(self, mock_run, server_factory):
         """Test handling of subprocess timeout."""
         mock_run.side_effect = subprocess.TimeoutExpired("make", 300)
 
-        # Create a temporary makefile for this test
-        makefile_content = "test:\n\techo 'test'"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
-            f.write(makefile_content)
-            makefile_path = f.name
+        server = server_factory(makefile_text="test:\n\techo 'test'")
+        make_tool = server.create_make_tool("test", "Test target")
+        result = make_tool()
 
-        try:
-            with patch("sys.argv", ["makefile_mcp.py", "--makefile", makefile_path]):
-                if "makefile_mcp" in sys.modules:
-                    del sys.modules["makefile_mcp"]
-
-                import makefile_mcp
-
-                make_tool = makefile_mcp.create_make_tool("test", "Test target")
-                result = make_tool()
-
-                assert result["status"] == "error"
-                assert "timed out" in result["message"]
-                assert result["exit_code"] == -1
-        finally:
-            os.unlink(makefile_path)
+        assert result["status"] == "error"
+        assert "timed out" in result["message"]
+        assert result["exit_code"] == -1
 
     @patch("subprocess.run")
-    def test_subprocess_error(self, mock_run):
+    def test_subprocess_error(self, mock_run, server_factory):
         """Test handling of subprocess errors."""
         mock_run.side_effect = subprocess.SubprocessError("Command failed")
 
-        makefile_content = "test:\n\techo 'test'"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".mk", delete=False) as f:
-            f.write(makefile_content)
-            makefile_path = f.name
+        server = server_factory(makefile_text="test:\n\techo 'test'")
+        make_tool = server.create_make_tool("test", "Test target")
+        result = make_tool()
 
-        try:
-            with patch("sys.argv", ["makefile_mcp.py", "--makefile", makefile_path]):
-                if "makefile_mcp" in sys.modules:
-                    del sys.modules["makefile_mcp"]
-
-                import makefile_mcp
-
-                make_tool = makefile_mcp.create_make_tool("test", "Test target")
-                result = make_tool()
-
-                assert result["status"] == "error"
-                assert "Failed to execute" in result["message"]
-                assert result["exit_code"] == -1
-        finally:
-            os.unlink(makefile_path)
+        assert result["status"] == "error"
+        assert "Failed to execute" in result["message"]
+        assert result["exit_code"] == -1
 
 
 class TestTimeoutPartialOutput:
     """Test that partial output captured before a timeout is preserved."""
 
     def _run_timed_out_target(self, tmp_path, timeout_error, extra_argv=()):
-        """Import a fresh module, run a target that times out, return (module, result)."""
+        """Initialize a server, run a target that times out, and return (server, result)."""
         makefile = tmp_path / "Makefile"
         makefile.write_text("slow:\n\tsleep 600\n")
 
-        argv = ["makefile_mcp.py", "--makefile", str(makefile), *extra_argv]
-        with patch("subprocess.run", side_effect=timeout_error), patch("sys.argv", argv):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            make_tool = makefile_mcp.create_make_tool("slow", "Slow target")
-            return makefile_mcp, make_tool()
+        with patch("subprocess.run", side_effect=timeout_error):
+            server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), *extra_argv])
+            make_tool = server.create_make_tool("slow", "Slow target")
+            return server, make_tool()
 
     def test_bytes_partial_output_is_cached(self, tmp_path):
         """Byte-valued captured output (what POSIX actually reports) is decoded and cached."""
@@ -1053,7 +898,7 @@ class TestTimeoutPartialOutput:
             output=b"compiling\nlinking\n",
             stderr=b"ld: undefined symbol _main\n",
         )
-        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        server, result = self._run_timed_out_target(tmp_path, error)
 
         assert result["status"] == "error"
         assert "timed out" in result["message"]
@@ -1066,7 +911,7 @@ class TestTimeoutPartialOutput:
         assert result["stderr_total_lines"] == 1
         assert result["stderr_total_chars"] == len("ld: undefined symbol _main\n")
 
-        cached = makefile_mcp.output_cache.get(result["execution_id"])
+        cached = server.output_cache.get(result["execution_id"])
         assert cached.stdout == "compiling\nlinking\n"
         assert cached.stderr == "ld: undefined symbol _main\n"
         assert cached.exit_code == -1
@@ -1075,7 +920,7 @@ class TestTimeoutPartialOutput:
     def test_str_partial_output_is_cached(self, tmp_path):
         """Already-decoded captured output is preserved without a secondary exception."""
         error = subprocess.TimeoutExpired("make", 300, output="running tests\n", stderr="warning: slow\n")
-        _makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        _server, result = self._run_timed_out_target(tmp_path, error)
 
         assert result["stdout_tail"] == "running tests\n"
         assert result["stderr_tail"] == "warning: slow\n"
@@ -1085,28 +930,28 @@ class TestTimeoutPartialOutput:
     def test_undecodable_bytes_do_not_raise(self, tmp_path):
         """Invalid UTF-8 in the partial stream is replaced rather than raising."""
         error = subprocess.TimeoutExpired("make", 300, output=b"ok\n\xff\n", stderr=None)
-        _makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        _server, result = self._run_timed_out_target(tmp_path, error)
 
         assert result["exit_code"] == -1
         assert result["stdout_total_lines"] == 2
-        assert "�" in result["stdout_tail"]
+        assert "\ufffd" in result["stdout_tail"]
 
     def test_partial_output_is_retrievable_by_execution_id(self, tmp_path):
         """get_output and search_output can read the cached partial streams."""
         stdout = "".join(f"step {i}\n" for i in range(10)) + "FATAL: disk full\n"
         error = subprocess.TimeoutExpired("make", 300, output=stdout.encode(), stderr=b"make: *** [slow] Error 1\n")
-        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        server, result = self._run_timed_out_target(tmp_path, error)
         eid = result["execution_id"]
 
-        paged = makefile_mcp.get_output(eid, stream="stdout", start_line=0, end_line=3)
+        paged = server.get_output(eid, stream="stdout", start_line=0, end_line=3)
         assert paged["status"] == "success"
         assert paged["total_lines"] == 11
         assert paged["content"].splitlines() == ["step 0", "step 1", "step 2"]
 
-        stderr_page = makefile_mcp.get_output(eid, stream="stderr", start_line=0, end_line=100)
+        stderr_page = server.get_output(eid, stream="stderr", start_line=0, end_line=100)
         assert stderr_page["content"].strip() == "make: *** [slow] Error 1"
 
-        found = makefile_mcp.search_output(eid, "FATAL")
+        found = server.search_output(eid, "FATAL")
         assert found["total_matches"] == 1
         assert found["matches"][0]["line_number"] == 10
         assert found["matches"][0]["text"] == "FATAL: disk full"
@@ -1115,20 +960,20 @@ class TestTimeoutPartialOutput:
         """Long partial output is truncated inline and points at the log tools."""
         stdout = "".join(f"line{i}\n" for i in range(100))
         error = subprocess.TimeoutExpired("make", 300, output=stdout.encode(), stderr=b"")
-        makefile_mcp, result = self._run_timed_out_target(tmp_path, error, extra_argv=["--tail-lines", "5"])
+        server, result = self._run_timed_out_target(tmp_path, error, extra_argv=["--tail-lines", "5"])
 
         assert result["stdout_tail"].splitlines() == ["line95", "line96", "line97", "line98", "line99"]
         assert result["stdout_total_lines"] == 100
         assert "truncation_note" in result
         assert f"get_output(execution_id={result['execution_id']})" in result["truncation_note"]
 
-        full = makefile_mcp.get_output(result["execution_id"], stream="stdout", start_line=0, end_line=1000)
+        full = server.get_output(result["execution_id"], stream="stdout", start_line=0, end_line=1000)
         assert full["total_lines"] == 100
 
     def test_empty_partial_output_has_zero_metadata(self, tmp_path):
         """A timeout with nothing captured still reports a clear error and zero-valued totals."""
         error = subprocess.TimeoutExpired("make", 300)
-        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        server, result = self._run_timed_out_target(tmp_path, error)
 
         assert result["status"] == "error"
         assert "timed out" in result["message"]
@@ -1141,21 +986,21 @@ class TestTimeoutPartialOutput:
         assert result["stderr_total_chars"] == 0
         assert "truncation_note" not in result
 
-        cached = makefile_mcp.output_cache.get(result["execution_id"])
+        cached = server.output_cache.get(result["execution_id"])
         assert cached.stdout == ""
         assert cached.stderr == ""
 
     def test_timeout_response_reports_command_context(self, tmp_path):
         """The timeout response carries the same command context as a completed run."""
         error = subprocess.TimeoutExpired("make", 300, output=b"partial\n")
-        makefile_mcp, result = self._run_timed_out_target(tmp_path, error)
+        server, result = self._run_timed_out_target(tmp_path, error)
 
         expected_command = " ".join(
-            ["make", "-C", str(makefile_mcp.WORKING_DIR), "-f", str(makefile_mcp.MAKEFILE_PATH), "slow"]
+            ["make", "-C", str(server.config.working_dir), "-f", str(server.config.makefile_path), "slow"]
         )
         assert result["command"] == expected_command
-        assert result["working_directory"] == str(makefile_mcp.WORKING_DIR)
-        assert makefile_mcp.output_cache.get(result["execution_id"]).command == expected_command
+        assert result["working_directory"] == str(server.config.working_dir)
+        assert server.output_cache.get(result["execution_id"]).command == expected_command
 
 
 class TestOutputCache:
@@ -1263,7 +1108,7 @@ class TestTailTruncation:
     """Test the tail-line truncation behavior in make tool responses."""
 
     @patch("subprocess.run")
-    def test_short_output_not_truncated(self, mock_run):
+    def test_short_output_not_truncated(self, mock_run, server_factory):
         """Output shorter than tail_lines should not be truncated."""
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -1271,19 +1116,15 @@ class TestTailTruncation:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py", "--tail-lines", "50"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
+        server = server_factory(extra_args=["--tail-lines", "50"])
+        make_tool = server.create_make_tool("build", "Build")
+        result = make_tool()
 
-            make_tool = makefile_mcp.create_make_tool("build", "Build")
-            result = make_tool()
-
-            assert result["stdout_tail"] == "line1\nline2\nline3\n"
-            assert "truncation_note" not in result
+        assert result["stdout_tail"] == "line1\nline2\nline3\n"
+        assert "truncation_note" not in result
 
     @patch("subprocess.run")
-    def test_long_output_truncated(self, mock_run):
+    def test_long_output_truncated(self, mock_run, server_factory):
         """Output longer than tail_lines should be truncated to last N lines."""
         lines = [f"line{i}" for i in range(100)]
         full_output = "\n".join(lines) + "\n"
@@ -1294,26 +1135,22 @@ class TestTailTruncation:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py", "--tail-lines", "5"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
+        server = server_factory(extra_args=["--tail-lines", "5"])
+        make_tool = server.create_make_tool("build", "Build")
+        result = make_tool()
 
-            make_tool = makefile_mcp.create_make_tool("build", "Build")
-            result = make_tool()
+        # Should only have the last 5 lines
+        tail_lines = result["stdout_tail"].splitlines()
+        assert len(tail_lines) == 5
+        assert tail_lines[0] == "line95"
+        assert tail_lines[4] == "line99"
 
-            # Should only have the last 5 lines
-            tail_lines = result["stdout_tail"].splitlines()
-            assert len(tail_lines) == 5
-            assert tail_lines[0] == "line95"
-            assert tail_lines[4] == "line99"
-
-            assert result["stdout_total_lines"] == 100
-            assert "truncation_note" in result
-            assert "get_output" in result["truncation_note"]
+        assert result["stdout_total_lines"] == 100
+        assert "truncation_note" in result
+        assert "get_output" in result["truncation_note"]
 
     @patch("subprocess.run")
-    def test_execution_id_in_response(self, mock_run):
+    def test_execution_id_in_response(self, mock_run, server_factory):
         """Response should include execution_id for cache retrieval."""
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -1321,37 +1158,30 @@ class TestTailTruncation:
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with patch("sys.argv", ["makefile_mcp.py"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
-
-            make_tool = makefile_mcp.create_make_tool("test", "Test")
-            result = make_tool()
-            assert "execution_id" in result
-            assert isinstance(result["execution_id"], int)
+        server = server_factory()
+        make_tool = server.create_make_tool("test", "Test")
+        result = make_tool()
+        assert "execution_id" in result
+        assert isinstance(result["execution_id"], int)
 
 
 class TestGetOutput:
     """Test the get_output MCP tool."""
 
-    def _setup(self):
-        """Set up a module with cached output."""
-        with patch("sys.argv", ["makefile_mcp.py"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
+    def _setup(self, server_factory):
+        """Set up a server with cached output."""
+        server = server_factory()
 
-            # Directly add to cache
-            lines = [f"line{i}" for i in range(20)]
-            full_output = "\n".join(lines) + "\n"
-            entry = makefile_mcp.output_cache.add("test", "make test", full_output, "err0\nerr1\n", 0)
-            return makefile_mcp, entry.execution_id
+        # Directly add to cache
+        lines = [f"line{i}" for i in range(20)]
+        full_output = "\n".join(lines) + "\n"
+        entry = server.output_cache.add("test", "make test", full_output, "err0\nerr1\n", 0)
+        return server, entry.execution_id
 
-    def test_basic_pagination(self):
+    def test_basic_pagination(self, server_factory):
         """Test retrieving a range of lines."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.get_output(eid, stream="stdout", start_line=0, end_line=5)
+        server, eid = self._setup(server_factory)
+        result = server.get_output(eid, stream="stdout", start_line=0, end_line=5)
 
         assert result["status"] == "success"
         assert result["execution_id"] == eid
@@ -1361,40 +1191,40 @@ class TestGetOutput:
         assert content_lines[4] == "line4"
         assert result["total_lines"] == 20
 
-    def test_middle_range(self):
+    def test_middle_range(self, server_factory):
         """Test retrieving lines from the middle."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.get_output(eid, stream="stdout", start_line=10, end_line=13)
+        server, eid = self._setup(server_factory)
+        result = server.get_output(eid, stream="stdout", start_line=10, end_line=13)
         content_lines = result["content"].splitlines()
         assert content_lines[0] == "line10"
         assert content_lines[2] == "line12"
 
-    def test_stderr_stream(self):
+    def test_stderr_stream(self, server_factory):
         """Test reading from stderr."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.get_output(eid, stream="stderr", start_line=0, end_line=100)
+        server, eid = self._setup(server_factory)
+        result = server.get_output(eid, stream="stderr", start_line=0, end_line=100)
         assert result["status"] == "success"
         assert "err0" in result["content"]
         assert result["total_lines"] == 2
 
-    def test_out_of_range_clamped(self):
+    def test_out_of_range_clamped(self, server_factory):
         """Test that out-of-range line numbers are clamped."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.get_output(eid, stream="stdout", start_line=0, end_line=9999)
+        server, eid = self._setup(server_factory)
+        result = server.get_output(eid, stream="stdout", start_line=0, end_line=9999)
         assert result["status"] == "success"
         assert result["end_line"] == result["total_lines"]
 
-    def test_missing_execution_id(self):
+    def test_missing_execution_id(self, server_factory):
         """Test error for missing execution ID."""
-        makefile_mcp, _eid = self._setup()
-        result = makefile_mcp.get_output(99999)
+        server, _eid = self._setup(server_factory)
+        result = server.get_output(99999)
         assert result["status"] == "error"
         assert "not found" in result["message"]
 
-    def test_invalid_stream(self):
+    def test_invalid_stream(self, server_factory):
         """Test error for invalid stream name."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.get_output(eid, stream="invalid")
+        server, eid = self._setup(server_factory)
+        result = server.get_output(eid, stream="invalid")
         assert result["status"] == "error"
         assert "Invalid stream" in result["message"]
 
@@ -1402,21 +1232,18 @@ class TestGetOutput:
 class TestSearchOutput:
     """Test the search_output MCP tool."""
 
-    def _setup(self):
-        """Set up a module with cached output."""
-        with patch("sys.argv", ["makefile_mcp.py"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
+    def _setup(self, server_factory):
+        """Set up a server with cached output."""
+        server = server_factory()
 
-            output = "Starting build\nCompiling main.c\nWARNING: deprecated function\nCompiling util.c\nLinking...\nWARNING: unused variable\nBuild complete\n"
-            entry = makefile_mcp.output_cache.add("build", "make build", output, "", 0)
-            return makefile_mcp, entry.execution_id
+        output = "Starting build\nCompiling main.c\nWARNING: deprecated function\nCompiling util.c\nLinking...\nWARNING: unused variable\nBuild complete\n"
+        entry = server.output_cache.add("build", "make build", output, "", 0)
+        return server, entry.execution_id
 
-    def test_basic_search(self):
+    def test_basic_search(self, server_factory):
         """Test basic substring search."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "WARNING")
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "WARNING")
 
         assert result["status"] == "success"
         assert result["total_matches"] == 2
@@ -1424,16 +1251,16 @@ class TestSearchOutput:
         assert "deprecated" in result["matches"][0]["text"]
         assert result["matches"][1]["line_number"] == 5
 
-    def test_case_insensitive(self):
+    def test_case_insensitive(self, server_factory):
         """Test that search is case-insensitive."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "warning")
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "warning")
         assert result["total_matches"] == 2
 
-    def test_context_lines(self):
+    def test_context_lines(self, server_factory):
         """Test that context lines are included."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "WARNING", context_lines=1)
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "WARNING", context_lines=1)
         match = result["matches"][0]
         context = match["context"]
 
@@ -1443,98 +1270,91 @@ class TestSearchOutput:
         assert context[1]["is_match"] is True
         assert context[2]["is_match"] is False
 
-    def test_no_matches(self):
+    def test_no_matches(self, server_factory):
         """Test search with no results."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "NONEXISTENT_PATTERN")
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "NONEXISTENT_PATTERN")
         assert result["status"] == "success"
         assert result["total_matches"] == 0
         assert result["matches"] == []
 
-    def test_missing_execution_id(self):
+    def test_missing_execution_id(self, server_factory):
         """Test error for missing execution ID."""
-        makefile_mcp, _eid = self._setup()
-        result = makefile_mcp.search_output(99999, "test")
+        server, _eid = self._setup(server_factory)
+        result = server.search_output(99999, "test")
         assert result["status"] == "error"
 
-    def test_search_stderr(self):
+    def test_search_stderr(self, server_factory):
         """Test searching stderr stream."""
-        with patch("sys.argv", ["makefile_mcp.py"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
+        server = server_factory()
+        entry = server.output_cache.add("t", "make t", "", "error: foo\nwarning: bar\n", 1)
+        result = server.search_output(entry.execution_id, "error", stream="stderr")
+        assert result["total_matches"] == 1
+        assert result["matches"][0]["line_number"] == 0
 
-            entry = makefile_mcp.output_cache.add("t", "make t", "", "error: foo\nwarning: bar\n", 1)
-            result = makefile_mcp.search_output(entry.execution_id, "error", stream="stderr")
-            assert result["total_matches"] == 1
-            assert result["matches"][0]["line_number"] == 0
-
-    def test_line_numbers_for_followup(self):
+    def test_line_numbers_for_followup(self, server_factory):
         """Test that match line numbers can be used with get_output."""
-        makefile_mcp, eid = self._setup()
-        search_result = makefile_mcp.search_output(eid, "WARNING")
+        server, eid = self._setup(server_factory)
+        search_result = server.search_output(eid, "WARNING")
 
         # Use first match line number with get_output
         line_num = search_result["matches"][0]["line_number"]
-        get_result = makefile_mcp.get_output(eid, start_line=line_num, end_line=line_num + 1)
+        get_result = server.get_output(eid, start_line=line_num, end_line=line_num + 1)
         assert "WARNING" in get_result["content"]
 
 
 class TestSearchOutputBounds:
     """Test search_output input validation and result bounding."""
 
-    def _setup(self, warning_count=40):
+    def _setup(self, server_factory, warning_count=40):
         """Cache an output where every other line matches 'WARNING'."""
-        with patch("sys.argv", ["makefile_mcp.py"]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-            import makefile_mcp
+        server = server_factory()
 
-            lines = []
-            for i in range(warning_count):
-                lines.append(f"Compiling file{i}.c")
-                lines.append(f"WARNING: issue {i}")
-            output = "\n".join(lines) + "\n"
-            entry = makefile_mcp.output_cache.add("build", "make build", output, "", 0)
-            return makefile_mcp, entry.execution_id
+        lines = []
+        for i in range(warning_count):
+            lines.append(f"Compiling file{i}.c")
+            lines.append(f"WARNING: issue {i}")
+        output = "\n".join(lines) + "\n"
+        entry = server.output_cache.add("build", "make build", output, "", 0)
+        return server, entry.execution_id
 
-    def test_empty_pattern_rejected(self):
+    def test_empty_pattern_rejected(self, server_factory):
         """An empty pattern would match every cached line and is rejected."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "")
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "")
         assert result["status"] == "error"
         assert "must not be empty" in result["message"]
         assert "matches" not in result
 
-    def test_negative_context_lines_rejected(self):
+    def test_negative_context_lines_rejected(self, server_factory):
         """Negative context sizes produce incoherent ranges and are rejected."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "WARNING", context_lines=-1)
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "WARNING", context_lines=-1)
         assert result["status"] == "error"
         assert "context_lines" in result["message"]
         assert "matches" not in result
 
-    def test_zero_context_lines_allowed(self):
+    def test_zero_context_lines_allowed(self, server_factory):
         """Zero context is valid and returns only the matching line."""
-        makefile_mcp, eid = self._setup()
-        result = makefile_mcp.search_output(eid, "WARNING: issue 0", context_lines=0)
+        server, eid = self._setup(server_factory)
+        result = server.search_output(eid, "WARNING: issue 0", context_lines=0)
         assert result["status"] == "success"
         assert result["total_matches"] == 1
         assert result["matches"][0]["context"] == [{"line_number": 1, "text": "WARNING: issue 0", "is_match": True}]
 
-    def test_non_positive_max_results_rejected(self):
+    def test_non_positive_max_results_rejected(self, server_factory):
         """max_results must be positive."""
-        makefile_mcp, eid = self._setup()
+        server, eid = self._setup(server_factory)
         for bad in (0, -5):
-            result = makefile_mcp.search_output(eid, "WARNING", max_results=bad)
+            result = server.search_output(eid, "WARNING", max_results=bad)
             assert result["status"] == "error"
             assert "max_results" in result["message"]
             assert "matches" not in result
 
-    def test_default_cap_truncates_and_reports_full_count(self):
+    def test_default_cap_truncates_and_reports_full_count(self, server_factory):
         """The default cap bounds returned matches while counting them all."""
-        makefile_mcp, eid = self._setup(warning_count=40)
-        result = makefile_mcp.search_output(eid, "WARNING", context_lines=1)
+        server, eid = self._setup(server_factory, warning_count=40)
+        result = server.search_output(eid, "WARNING", context_lines=1)
 
         cap = makefile_mcp.DEFAULT_MAX_SEARCH_RESULTS
         assert cap == 20
@@ -1552,10 +1372,10 @@ class TestSearchOutputBounds:
         assert result["matches"][0]["text"] == "WARNING: issue 0"
         assert result["matches"][-1]["text"] == f"WARNING: issue {cap - 1}"
 
-    def test_explicit_max_results_caps_matches(self):
+    def test_explicit_max_results_caps_matches(self, server_factory):
         """An explicit max_results overrides the default cap."""
-        makefile_mcp, eid = self._setup(warning_count=40)
-        result = makefile_mcp.search_output(eid, "WARNING", max_results=3)
+        server, eid = self._setup(server_factory, warning_count=40)
+        result = server.search_output(eid, "WARNING", max_results=3)
 
         assert result["total_matches"] == 40
         assert result["returned_matches"] == 3
@@ -1563,10 +1383,10 @@ class TestSearchOutputBounds:
         assert result["truncated"] is True
         assert [m["line_number"] for m in result["matches"]] == [1, 3, 5]
 
-    def test_uncapped_search_returns_every_match(self):
+    def test_uncapped_search_returns_every_match(self, server_factory):
         """A search below the cap returns all matches and reports no truncation."""
-        makefile_mcp, eid = self._setup(warning_count=5)
-        result = makefile_mcp.search_output(eid, "WARNING", context_lines=1)
+        server, eid = self._setup(server_factory, warning_count=5)
+        result = server.search_output(eid, "WARNING", context_lines=1)
 
         assert result["total_matches"] == 5
         assert result["returned_matches"] == 5
@@ -1580,10 +1400,10 @@ class TestSearchOutputBounds:
             {"line_number": 2, "text": "Compiling file1.c", "is_match": False},
         ]
 
-    def test_no_matches_is_not_truncated(self):
+    def test_no_matches_is_not_truncated(self, server_factory):
         """A zero-match search reports no truncation."""
-        makefile_mcp, eid = self._setup(warning_count=5)
-        result = makefile_mcp.search_output(eid, "NONEXISTENT_PATTERN")
+        server, eid = self._setup(server_factory, warning_count=5)
+        result = server.search_output(eid, "NONEXISTENT_PATTERN")
         assert result["total_matches"] == 0
         assert result["returned_matches"] == 0
         assert result["truncated"] is False
@@ -1725,14 +1545,9 @@ class TestRealMakeExpansionRegression:
     )
     def test_project_path_never_executes_the_assignment(self, harness, additional_args):
         """The same input through the generated tool is rejected and runs no command."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", str(harness)]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
-            result = make_tool(additional_args=additional_args)
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(harness)])
+        make_tool = server.create_make_tool("safe", "Run the safe target")
+        result = make_tool(additional_args=additional_args)
 
         # The marker assertion carries the security claim, so it runs before the
         # weaker response-shape assertions and cannot be masked by them.
@@ -1742,14 +1557,9 @@ class TestRealMakeExpansionRegression:
 
     def test_literal_assignment_still_reaches_real_make(self, harness):
         """A plain value is not collateral damage: it runs and stays a single argv token."""
-        with patch("sys.argv", ["makefile_mcp.py", "--makefile", str(harness)]):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            make_tool = makefile_mcp.create_make_tool("safe", "Run the safe target")
-            result = make_tool(additional_args='VERBOSE=1 MESSAGE="hello world"')
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(harness)])
+        make_tool = server.create_make_tool("safe", "Run the safe target")
+        result = make_tool(additional_args='VERBOSE=1 MESSAGE="hello world"')
 
         assert result["status"] == "success"
         assert "safe target ran" in result["stdout_tail"]
@@ -1783,7 +1593,7 @@ class TestSingleToolRegistration:
         with patch.object(fastmcp.FastMCP, "tool", recording_tool):
             yield registered
 
-    def test_direct_script_registers_each_target_once(self, tmp_path):
+    def test_direct_script_registers_each_target_once(self, tmp_path, capsys):
         """`uv run makefile_mcp.py` executes the module as __main__ and registers one tool per target."""
         import fastmcp
 
@@ -1793,7 +1603,7 @@ class TestSingleToolRegistration:
         argv = ["makefile_mcp.py", "--makefile", str(makefile_path)]
         with patch("sys.argv", argv), self._recorded_registrations() as registered:
             with patch.object(fastmcp.FastMCP, "run") as run:
-                module_globals = runpy.run_path(str(self.MODULE_PATH), run_name="__main__")
+                runpy.run_path(str(self.MODULE_PATH), run_name="__main__")
 
         # The registration counts carry the regression claim, so they run before the
         # weaker lifecycle assertions and cannot be masked by them.
@@ -1801,44 +1611,66 @@ class TestSingleToolRegistration:
         assert registered.count("make_test") == 1
         for utility in ("list_available_targets", "get_makefile_info", "get_output", "search_output"):
             assert registered.count(utility) == 1
-        assert module_globals["filtered_targets"] == {"build": "Build it", "test": "Test it"}
+        assert "Available targets: build, test" in capsys.readouterr().err
         run.assert_called_once_with()
 
     def test_imported_main_registers_each_target_once(self, tmp_path):
         """The console-script entry point registers one tool per target too."""
+        import fastmcp
+
         makefile_path = tmp_path / "Makefile"
         makefile_path.write_text(self.MAKEFILE_CONTENT)
 
-        argv = ["makefile_mcp.py", "--makefile", str(makefile_path)]
-        with patch("sys.argv", argv):
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
-
-            import makefile_mcp
-
-            with self._recorded_registrations() as registered:
-                with patch.object(makefile_mcp.mcp_server, "run") as run:
-                    makefile_mcp.main()
+        with self._recorded_registrations() as registered:
+            with patch.object(fastmcp.FastMCP, "run") as run:
+                server = makefile_mcp.main(["--makefile", str(makefile_path)])
 
         assert registered.count("make_build") == 1
         assert registered.count("make_test") == 1
-        assert makefile_mcp.filtered_targets == {"build": "Build it", "test": "Test it"}
+        assert server.filtered_targets == {"build": "Build it", "test": "Test it"}
         run.assert_called_once_with()
 
-    def test_import_alone_registers_no_target_tools(self, tmp_path):
-        """Importing the module must not register target tools before main() validates configuration."""
+    def test_import_alone_registers_no_tools(self):
+        """Executing the module without main() registers nothing and exposes no server.
+
+        runpy re-executes the file under a non-__main__ name to observe the import
+        contract itself; no test resets state this way — state is built by calling
+        initialize_makefile_mcp().
+        """
+        with self._recorded_registrations() as registered:
+            module_globals = runpy.run_path(str(self.MODULE_PATH), run_name="makefile_mcp_import")
+
+        assert registered == []
+        assert "mcp_server" not in module_globals
+        assert "filtered_targets" not in module_globals
+
+    def test_reinitialization_resets_state_without_reimport(self, tmp_path):
+        """Calling initialize_makefile_mcp() again yields a fully independent server.
+
+        This is the reset pattern that replaced deleting the module from sys.modules
+        and reimporting it: a new init call builds fresh state, and nothing from the
+        previous server — registrations, cache, execution IDs — leaks into it.
+        """
         makefile_path = tmp_path / "Makefile"
         makefile_path.write_text(self.MAKEFILE_CONTENT)
 
-        argv = ["makefile_mcp.py", "--makefile", str(makefile_path)]
-        with patch("sys.argv", argv), self._recorded_registrations() as registered:
-            if "makefile_mcp" in sys.modules:
-                del sys.modules["makefile_mcp"]
+        first = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile_path)])
+        first.output_cache.add("build", "make build", "first run\n", "", 0)
 
-            import makefile_mcp
+        with self._recorded_registrations() as registered:
+            second = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile_path)])
 
-        assert [name for name in registered if name.startswith("make_")] == []
-        assert makefile_mcp.filtered_targets == {}
+        # The fresh server re-registers every tool exactly once, on its own FastMCP
+        # instance, rather than doubling up registrations on shared module state.
+        assert registered.count("make_build") == 1
+        for utility in ("list_available_targets", "get_makefile_info", "get_output", "search_output"):
+            assert registered.count(utility) == 1
+
+        assert second.mcp_server is not first.mcp_server
+        assert second.output_cache is not first.output_cache
+        assert len(second.output_cache) == 0
+        assert second.output_cache.get(1) is None
+        assert second.filtered_targets == {"build": "Build it", "test": "Test it"}
 
 
 if __name__ == "__main__":

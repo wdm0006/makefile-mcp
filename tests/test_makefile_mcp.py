@@ -1079,6 +1079,7 @@ class TestConfigurableTimeout:
 
         assert elapsed < 10, f"run took {elapsed:.1f}s; the 1s timeout did not kill the target"
         assert result["status"] == "error"
+        assert result["target"] == "slow"
         assert result["exit_code"] == -1
         assert "timed out after 1 seconds" in result["message"]
 

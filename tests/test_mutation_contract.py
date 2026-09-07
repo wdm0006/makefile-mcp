@@ -80,10 +80,20 @@ class TestCliDefaults:
         assert len(cache) == 20
         assert cache.get(1) is None
 
+    def test_output_cache_entry_records_monotonic_wall_time(self):
+        cache = makefile_mcp.OutputCache()
+        first = cache.add(target="t", command="c", stdout="o", stderr="", exit_code=0)
+        second = cache.add(target="t", command="c", stdout="o", stderr="", exit_code=0)
+        assert isinstance(first.timestamp, float)
+        assert first.timestamp > 0
+        assert second.timestamp >= first.timestamp
+
     def test_positive_int_rejection_message(self, capsys):
         with pytest.raises(SystemExit):
             makefile_mcp.parse_cli_args(["--timeout", "0"])
-        assert "must be a positive integer" in capsys.readouterr().err
+        # The leading colon pins the message text — a mutant that wraps the
+        # message in marker text must not match.
+        assert ": must be a positive integer" in capsys.readouterr().err
 
 
 class TestParserContract:
@@ -114,6 +124,17 @@ class TestParserContract:
         assert targets["orphan_target"] == "orphan desc"
         assert "indented_fake" not in targets
         assert not any("%" in name for name in targets)
+
+    def test_pattern_rules_are_not_targets(self, tmp_path):
+        """Implicit pattern rules (%.o: %.c) must not surface as runnable targets."""
+        makefile = write_makefile(
+            tmp_path,
+            "# Build\nbuild: app.o\n\ttrue\n\n%.o: %.c\n\ttrue\n\n# Clean\nclean:\n\ttrue\n",
+        )
+        targets = makefile_mcp.MakefileParser(makefile).get_targets()
+        assert "%.o" not in targets
+        assert "%.c" not in targets
+        assert targets == {"build": "Build", "clean": "Clean"}
 
     def test_non_utf8_makefile_falls_back_to_latin1(self, tmp_path):
         makefile = tmp_path / "Makefile"
@@ -165,7 +186,12 @@ class TestAllowlistScanner:
             ["--output-sync"],
             ["--debug"],
             ["--silent", "--trace"],
+            ["--silent", "--trace", "--debug"],
+            ["--debug", "--output-sync", "--debug"],
             ["-ks"],
+            ["-ssk"],
+            ["-kss"],
+            ["A=1", "B=2", "C=3"],
             ["X=1"],
             ["X:=1"],
             ["X+=1"],
@@ -196,6 +222,8 @@ class TestAllowlistScanner:
             (["-skzk"], "option '-z' is not in the allowed make option set"),
             (["--frobnicate"], "option '--frobnicate' is not in the allowed make option set"),
             (["--silent=1"], "option '--silent' does not take a value"),
+            (["--debug", "-z"], "option '-z' is not in the allowed make option set"),
+            (["-sskz"], "option '-z' is not in the allowed make option set"),
             (["clean"], "'clean' is not an allowed variable assignment or option (it would select another target)"),
             (["A=1", "-z"], "option '-z' is not in the allowed make option set"),
             (["A=1", "B=2", "-z"], "option '-z' is not in the allowed make option set"),
@@ -265,6 +293,8 @@ class TestToolResponseContract:
         with patch("makefile_mcp.subprocess.run", side_effect=OSError("boom")):
             result = tool()
         assert result["status"] == "error"
+        assert result["target"] == "build"
+        assert result["exit_code"] == -1
         assert result["message"] == "Failed to execute target 'build': boom"
 
     def test_get_output_contract_and_defaults(self, tmp_path):
@@ -290,6 +320,14 @@ class TestToolResponseContract:
         assert len(page["content"].splitlines()) == 100
         assert page["target"] == "emit"
         assert page["stream"] == "stdout"
+
+        # The stderr side of the cached entry must be readable too: an execution
+        # with no stderr output pages back as an empty success response.
+        err_page = server.get_output(first["execution_id"], stream="stderr")
+        assert err_page["status"] == "success"
+        assert err_page["stream"] == "stderr"
+        assert err_page["total_lines"] == 0
+        assert err_page["content"] == ""
 
     def test_search_output_contract(self, server_factory):
         server = server_factory()
@@ -367,6 +405,8 @@ class TestToolResponseContract:
         }
         assert result["total_targets_in_makefile"] == 3
         assert result["available_targets"] == 1
+        assert result["makefile_path"] == str(server.config.makefile_path)
+        assert result["working_directory"] == str(server.config.working_dir)
         assert result["include_filter"] == ["build"]
         assert result["exclude_filter"] == ["test"]
         assert result["targets"] == [{"name": "build", "description": "Build the project", "tool_name": "make_build"}]
@@ -390,8 +430,11 @@ class TestToolResponseContract:
             "filters",
         }
         assert result["makefile_exists"] is True
+        assert result["makefile_path"] == str(server.config.makefile_path)
+        assert result["working_directory"] == str(server.config.working_dir)
         assert result["all_targets"]["count"] == 3
         assert result["filtered_targets"]["count"] == 1
+        assert result["filtered_targets"]["targets"] == [{"name": "build", "description": "Build the project"}]
         # include/exclude are sets at config level, so list order is not deterministic
         assert sorted(result["filters"]["include"]) == ["build", "test"]
         assert sorted(result["filters"]["exclude"]) == ["test"]
@@ -487,7 +530,7 @@ class TestStartupBanner:
             text=True,
             timeout=30,
         )
-        assert "Starting Makefile MCP server" in proc.stderr
+        assert proc.stderr.startswith("Starting Makefile MCP server\n")
         assert f"  Makefile: {makefile}" in proc.stderr
         assert "  Available targets: build, lint" in proc.stderr
         exclude_line = next(line for line in proc.stderr.splitlines() if line.startswith("  Exclude filter: "))

@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from fastmcp import FastMCP
 
@@ -197,7 +197,7 @@ class MakefileParser:
         self.targets: Dict[str, str] = {}
         self._parse()
 
-    def _parse(self):
+    def _parse(self) -> None:
         """Parse the Makefile to extract targets and their descriptions."""
         try:
             with open(self.makefile_path, "r", encoding="utf-8") as f:
@@ -330,26 +330,26 @@ def _as_text(stream: Any) -> str:
     return str(stream)
 
 
-def _lookup_cached_stream(
-    cache: OutputCache, execution_id: int, stream: str
-) -> tuple[Optional[CachedExecution], Optional[Dict[str, Any]]]:
+def _lookup_cached_stream(cache: OutputCache, execution_id: int, stream: str) -> Union[CachedExecution, Dict[str, Any]]:
     """Resolve the preconditions shared by get_output() and search_output().
 
-    Returns (entry, None) when the execution is cached and the stream name is
-    valid, or (None, error_response) describing the failure otherwise.
+    Returns the cached entry when the execution is cached and the stream name
+    is valid, or an error response dict describing the failure otherwise. The
+    union return (instead of a (value, error) tuple) lets callers narrow with
+    isinstance() — mypy cannot correlate tuple elements after unpacking.
     """
     cached = cache.get(execution_id)
     if cached is None:
-        return None, {
+        return {
             "status": "error",
             "message": f"Execution ID {execution_id} not found in cache.",
         }
     if stream not in ("stdout", "stderr"):
-        return None, {
+        return {
             "status": "error",
             "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
         }
-    return cached, None
+    return cached
 
 
 def make_tool_name(target_name: str) -> str:
@@ -516,7 +516,7 @@ class MakefileServer:
         self.mcp_server.tool()(self.get_output)
         self.mcp_server.tool()(self.search_output)
 
-    def create_make_tool(self, target_name: str, description: str):
+    def create_make_tool(self, target_name: str, description: str) -> Callable[[Optional[str], bool], Dict[str, Any]]:
         """Create an MCP tool for a specific make target."""
         config = self.config
 
@@ -636,7 +636,7 @@ class MakefileServer:
 
         return make_target
 
-    def register_make_tools(self) -> List[tuple[str, str]]:
+    def register_make_tools(self) -> List[Tuple[str, Callable[[Optional[str], bool], Dict[str, Any]]]]:
         """Validate and register MCP tools for the discovered make targets."""
         validate_tool_names(self.filtered_targets)
         return [
@@ -710,9 +710,10 @@ class MakefileServer:
         Returns:
             dict: The requested lines and metadata.
         """
-        cached, error = _lookup_cached_stream(self.output_cache, execution_id, stream)
-        if error is not None:
-            return error
+        lookup = _lookup_cached_stream(self.output_cache, execution_id, stream)
+        if isinstance(lookup, dict):
+            return lookup
+        cached = lookup
 
         text = cached.stdout if stream == "stdout" else cached.stderr
         lines = text.splitlines(keepends=True)
@@ -777,9 +778,10 @@ class MakefileServer:
                 "message": f"Invalid max_results {max_results}. Must be 1 or greater.",
             }
 
-        cached, error = _lookup_cached_stream(self.output_cache, execution_id, stream)
-        if error is not None:
-            return error
+        lookup = _lookup_cached_stream(self.output_cache, execution_id, stream)
+        if isinstance(lookup, dict):
+            return lookup
+        cached = lookup
 
         text = cached.stdout if stream == "stdout" else cached.stderr
         lines = text.splitlines()

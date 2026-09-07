@@ -134,6 +134,11 @@ class TestParserContract:
         assert makefile_mcp.get_makefile_targets(exclude_config) == {"build": "Build", "clean": "Clean"}
         assert capsys.readouterr().err == ""
 
+    def test_get_makefile_targets_missing_file_returns_empty(self, tmp_path, capsys):
+        config = makefile_mcp.build_config(makefile_mcp.parse_cli_args(["--makefile", str(tmp_path / "absent")]))
+        assert makefile_mcp.get_makefile_targets(config) == {}
+        assert capsys.readouterr().err == ""
+
     def test_get_makefile_targets_warning_text(self, tmp_path, capsys):
         makefile = write_makefile(tmp_path, "# only comments, no targets\n")
         config = makefile_mcp.build_config(makefile_mcp.parse_cli_args(["--makefile", str(makefile)]))
@@ -157,6 +162,8 @@ class TestAllowlistScanner:
             ["--jobs=4"],
             ["--jobs", "4"],
             ["--no-print-directory"],
+            ["--output-sync"],
+            ["--debug"],
             ["--silent", "--trace"],
             ["-ks"],
             ["X=1"],
@@ -188,6 +195,7 @@ class TestAllowlistScanner:
             (["-z"], "option '-z' is not in the allowed make option set"),
             (["-skzk"], "option '-z' is not in the allowed make option set"),
             (["--frobnicate"], "option '--frobnicate' is not in the allowed make option set"),
+            (["--silent=1"], "option '--silent' does not take a value"),
             (["clean"], "'clean' is not an allowed variable assignment or option (it would select another target)"),
             (["A=1", "-z"], "option '-z' is not in the allowed make option set"),
             (["A=1", "B=2", "-z"], "option '-z' is not in the allowed make option set"),

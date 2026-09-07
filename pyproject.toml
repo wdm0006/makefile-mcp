@@ -21,7 +21,9 @@ dependencies = [
 dev = [
     "ruff==0.16.6",
     "pytest",
+    "pytest-timeout",
     "pre-commit",
+    "mutmut==3.7.0",
 ]
 
 [project.scripts]
@@ -40,3 +42,12 @@ ignore = ["E501", "C901"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Coverage floor lives in the CI/Makefile pytest invocations (not addopts) so
+# mutation runs measure test strength, not the coverage gate itself.
+addopts = "--timeout=60"
+
+[tool.mutmut]
+source_paths = ["makefile_mcp.py"]

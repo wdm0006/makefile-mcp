@@ -1,0 +1,5 @@
+# Repo policy for obvious agents — wdm0006/makefile-mcp
+# Auto-detected from GitHub repo settings on 2026-09-06.
+defaultBranch: main       # repo defaultBranchRef
+mergeMethod: squash       # repo allows merge/squash/rebase; squash is the agent default
+requireHumanMerge: true   # a human must click merge on default-branch PRs

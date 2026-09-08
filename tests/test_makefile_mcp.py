@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -876,6 +877,30 @@ class TestErrorHandling:
         assert "Failed to execute" in result["message"]
         assert result["exit_code"] == -1
 
+    @patch("subprocess.run")
+    def test_os_error_is_reported_structurally(self, mock_run, server_factory):
+        """A missing make binary is a tool-level failure, not a crash."""
+        mock_run.side_effect = FileNotFoundError(2, "No such file or directory", "make")
+
+        server = server_factory(makefile_text="test:\n\techo 'test'")
+        make_tool = server.create_make_tool("test", "Test target")
+        result = make_tool()
+
+        assert result["status"] == "error"
+        assert "Failed to execute" in result["message"]
+        assert result["exit_code"] == -1
+
+    @patch("subprocess.run")
+    def test_unexpected_errors_propagate(self, mock_run, server_factory):
+        """Non-execution errors are bugs: they surface instead of being masked."""
+        mock_run.side_effect = RuntimeError("programming bug")
+
+        server = server_factory(makefile_text="test:\n\techo 'test'")
+        make_tool = server.create_make_tool("test", "Test target")
+
+        with pytest.raises(RuntimeError, match="programming bug"):
+            make_tool()
+
 
 class TestTimeoutPartialOutput:
     """Test that partial output captured before a timeout is preserved."""
@@ -1001,6 +1026,67 @@ class TestTimeoutPartialOutput:
         assert result["command"] == expected_command
         assert result["working_directory"] == str(server.config.working_dir)
         assert server.output_cache.get(result["execution_id"]).command == expected_command
+
+
+class TestConfigurableTimeout:
+    """Test the --timeout flag: a run exceeding it is killed and reported."""
+
+    @patch("subprocess.run")
+    def test_timeout_flag_reaches_subprocess(self, mock_run, tmp_path):
+        """The configured timeout value is passed to subprocess.run, not hard-coded."""
+        makefile = tmp_path / "Makefile"
+        makefile.write_text("build:\n\techo building\n")
+        mock_run.return_value = MagicMock(returncode=0, stdout="building\n", stderr="")
+
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--timeout", "42"])
+        assert server.config.timeout_seconds == 42
+
+        make_tool = server.create_make_tool("build", "Build")
+        result = make_tool()
+
+        assert result["status"] == "success"
+        assert mock_run.call_args.kwargs["timeout"] == 42
+
+    @patch("subprocess.run")
+    def test_default_timeout_is_300_seconds(self, mock_run, server_factory):
+        """Without the flag, the historical 300-second default applies."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        server = server_factory()
+        make_tool = server.create_make_tool("build", "Build")
+        result = make_tool()
+
+        assert result["status"] == "success"
+        assert mock_run.call_args.kwargs["timeout"] == 300
+
+    @pytest.mark.skipif(shutil.which("make") is None, reason="requires a make executable")
+    def test_run_exceeding_timeout_is_killed_and_reported(self, tmp_path):
+        """An unmocked run longer than --timeout is killed and reported as a timeout error.
+
+        The target sleeps far longer than the configured timeout; the response must come
+        back quickly with the timeout report, and the killed run must still be cached so
+        get_output/search_output can address it.
+        """
+        makefile = tmp_path / "Makefile"
+        makefile.write_text("slow:\n\tsleep 30\n")
+
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--timeout", "1"])
+        make_tool = server.create_make_tool("slow", "Slow target")
+
+        started = time.monotonic()
+        result = make_tool()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 10, f"run took {elapsed:.1f}s; the 1s timeout did not kill the target"
+        assert result["status"] == "error"
+        assert result["target"] == "slow"
+        assert result["exit_code"] == -1
+        assert "timed out after 1 seconds" in result["message"]
+
+        cached = server.output_cache.get(result["execution_id"])
+        assert cached is not None
+        assert cached.target == "slow"
+        assert cached.exit_code == -1
 
 
 class TestOutputCache:

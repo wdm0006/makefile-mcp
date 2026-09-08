@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from fastmcp import FastMCP
 
@@ -107,6 +107,7 @@ class ServerConfig:
     exclude_targets: Set[str]
     max_cached_executions: int
     tail_lines: int
+    timeout_seconds: int
 
 
 def positive_int(value: str) -> int:
@@ -149,6 +150,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=50,
         help="Number of tail lines to include in make tool responses (default: 50)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=300,
+        help="Seconds to wait before a running make target is killed (default: 300)",
+    )
 
     return parser.parse_args(argv)
 
@@ -178,6 +185,7 @@ def build_config(cli_args: argparse.Namespace) -> ServerConfig:
         exclude_targets=_parse_target_list(cli_args.exclude) or set(),
         max_cached_executions=cli_args.max_cached_executions,
         tail_lines=cli_args.tail_lines,
+        timeout_seconds=cli_args.timeout,
     )
 
 
@@ -189,7 +197,7 @@ class MakefileParser:
         self.targets: Dict[str, str] = {}
         self._parse()
 
-    def _parse(self):
+    def _parse(self) -> None:
         """Parse the Makefile to extract targets and their descriptions."""
         try:
             with open(self.makefile_path, "r", encoding="utf-8") as f:
@@ -221,8 +229,11 @@ class MakefileParser:
             target_match = re.match(r"^([a-zA-Z0-9_.-][a-zA-Z0-9_.\- ]*?)\s*:(?![:=])", line)
             if target_match:
                 for target_name in target_match.group(1).split():
-                    # Skip special targets that start with . or contain %
-                    if target_name.startswith(".") or "%" in target_name:
+                    # Skip special targets that start with "." (e.g. .PHONY).
+                    # Pattern rules ("%.o: ...") never match the target regex at
+                    # all — its character classes exclude "%" — so no matched
+                    # name can hold one; no separate check is needed.
+                    if target_name.startswith("."):
                         continue
 
                     # Apply the preceding comment to every target on the rule,
@@ -320,6 +331,28 @@ def _as_text(stream: Any) -> str:
     if isinstance(stream, (bytes, bytearray)):
         return bytes(stream).decode("utf-8", errors="replace")
     return str(stream)
+
+
+def _lookup_cached_stream(cache: OutputCache, execution_id: int, stream: str) -> Union[CachedExecution, Dict[str, Any]]:
+    """Resolve the preconditions shared by get_output() and search_output().
+
+    Returns the cached entry when the execution is cached and the stream name
+    is valid, or an error response dict describing the failure otherwise. The
+    union return (instead of a (value, error) tuple) lets callers narrow with
+    isinstance() — mypy cannot correlate tuple elements after unpacking.
+    """
+    cached = cache.get(execution_id)
+    if cached is None:
+        return {
+            "status": "error",
+            "message": f"Execution ID {execution_id} not found in cache.",
+        }
+    if stream not in ("stdout", "stderr"):
+        return {
+            "status": "error",
+            "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
+        }
+    return cached
 
 
 def make_tool_name(target_name: str) -> str:
@@ -486,7 +519,7 @@ class MakefileServer:
         self.mcp_server.tool()(self.get_output)
         self.mcp_server.tool()(self.search_output)
 
-    def create_make_tool(self, target_name: str, description: str):
+    def create_make_tool(self, target_name: str, description: str) -> Callable[[Optional[str], bool], Dict[str, Any]]:
         """Create an MCP tool for a specific make target."""
         config = self.config
 
@@ -527,7 +560,7 @@ class MakefileServer:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=300,  # 5 minute timeout
+                    timeout=config.timeout_seconds,
                 )
 
                 # Cache full output
@@ -579,22 +612,18 @@ class MakefileServer:
                     "command": command_str,
                     "working_directory": str(config.working_dir),
                     "status": "error",
-                    "message": f"Target '{target_name}' timed out after 5 minutes",
+                    "message": f"Target '{target_name}' timed out after {config.timeout_seconds} seconds",
                     "exit_code": -1,
                     **_bounded_output_fields(partial_stdout, partial_stderr, config.tail_lines, cached.execution_id),
                 }
-            except subprocess.SubprocessError as e:
+            except (subprocess.SubprocessError, OSError) as e:
+                # Subprocess failures and OS-level execution errors (e.g. the make
+                # binary itself missing or not executable) are reported structurally;
+                # anything else is a bug and must surface instead of being masked.
                 return {
                     "target": target_name,
                     "status": "error",
                     "message": f"Failed to execute target '{target_name}': {str(e)}",
-                    "exit_code": -1,
-                }
-            except Exception as e:
-                return {
-                    "target": target_name,
-                    "status": "error",
-                    "message": f"Unexpected error executing target '{target_name}': {str(e)}",
                     "exit_code": -1,
                 }
 
@@ -610,7 +639,7 @@ class MakefileServer:
 
         return make_target
 
-    def register_make_tools(self) -> List[tuple[str, str]]:
+    def register_make_tools(self) -> List[Tuple[str, Callable[[Optional[str], bool], Dict[str, Any]]]]:
         """Validate and register MCP tools for the discovered make targets."""
         validate_tool_names(self.filtered_targets)
         return [
@@ -684,18 +713,10 @@ class MakefileServer:
         Returns:
             dict: The requested lines and metadata.
         """
-        cached = self.output_cache.get(execution_id)
-        if cached is None:
-            return {
-                "status": "error",
-                "message": f"Execution ID {execution_id} not found in cache.",
-            }
-
-        if stream not in ("stdout", "stderr"):
-            return {
-                "status": "error",
-                "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
-            }
+        lookup = _lookup_cached_stream(self.output_cache, execution_id, stream)
+        if isinstance(lookup, dict):
+            return lookup
+        cached = lookup
 
         text = cached.stdout if stream == "stdout" else cached.stderr
         lines = text.splitlines(keepends=True)
@@ -760,18 +781,10 @@ class MakefileServer:
                 "message": f"Invalid max_results {max_results}. Must be 1 or greater.",
             }
 
-        cached = self.output_cache.get(execution_id)
-        if cached is None:
-            return {
-                "status": "error",
-                "message": f"Execution ID {execution_id} not found in cache.",
-            }
-
-        if stream not in ("stdout", "stderr"):
-            return {
-                "status": "error",
-                "message": f"Invalid stream '{stream}'. Must be 'stdout' or 'stderr'.",
-            }
+        lookup = _lookup_cached_stream(self.output_cache, execution_id, stream)
+        if isinstance(lookup, dict):
+            return lookup
+        cached = lookup
 
         text = cached.stdout if stream == "stdout" else cached.stderr
         lines = text.splitlines()

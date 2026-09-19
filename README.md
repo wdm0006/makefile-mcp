@@ -56,13 +56,22 @@ makefile-mcp --tail-lines 10
 makefile-mcp --timeout 60
 ```
 
+Filter names are checked against the targets the Makefile actually defines. An
+`--exclude` name that is not a target is a **startup error**: the server reports every
+unknown entry on stderr and exits non-zero rather than serving with a filter that hides
+nothing — so a typo, or a target renamed out from under the configuration, cannot
+silently re-expose something you meant to hide. An unknown `--include` name only warns
+and startup continues, because an include filter that names a missing target already
+fails closed, and one client configuration may point at several Makefiles with
+different target sets.
+
 ### CLI reference
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--makefile PATH` | `Makefile` | Makefile to parse and execute |
-| `--include a,b` | all targets | expose only these targets |
-| `--exclude a,b` | none | hide these targets |
+| `--include a,b` | all targets | expose only these targets; an unknown name warns |
+| `--exclude a,b` | none | hide these targets; an unknown name is a startup error |
 | `--working-dir PATH` | the Makefile's directory | directory make runs in |
 | `--max-cached-executions N` | `20` | how many executions stay cached; the oldest is evicted first, so old `execution_id`s eventually expire |
 | `--tail-lines N` | `50` | lines of each stream included inline in make tool responses |

@@ -555,6 +555,19 @@ class TestFilterNameDiagnostics:
             "Error: --exclude names targets not found in the Makefile: publsh\n"
         )
 
+    def test_trailing_comma_is_not_an_unknown_name(self, tmp_path, capsys):
+        """A trailing or doubled comma leaves an empty name in the parsed set; it is not reported.
+
+        Without this the server would exit on `--exclude deploy,` with a diagnostic that
+        names nothing — a config that worked before the check was added.
+        """
+        makefile = write_makefile(tmp_path, self.TWO_TARGETS)
+        server = makefile_mcp.initialize_makefile_mcp(
+            ["--makefile", str(makefile), "--include", "build,deploy,", "--exclude", "deploy,,"]
+        )
+        assert capsys.readouterr().err == ""
+        assert server.filtered_targets == {"build": "Build"}
+
     def test_empty_include_filter_only_message(self, tmp_path, capsys):
         """A fully mistyped --include warns, then exits on the empty filtered set."""
         makefile = write_makefile(tmp_path, self.TWO_TARGETS)

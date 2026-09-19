@@ -383,18 +383,22 @@ def validate_filter_names(all_targets: Dict[str, str], include: Optional[Set[str
     than a safety one, and hard-failing it would break a single client configuration
     pointed at several Makefiles with different target sets: it warns and starts.
 
+    An empty name is skipped rather than reported: a trailing or doubled comma
+    ("deploy,") leaves one in the parsed set, it can never match a make target, and
+    reporting it would exit with a diagnostic that names nothing.
+
     Raises:
         ValueError: if --exclude names any target the Makefile does not define.
     """
     if include is not None:
-        unknown_include = sorted(include - all_targets.keys())
+        unknown_include = sorted(name for name in include if name and name not in all_targets)
         if unknown_include:
             print(
                 f"Warning: --include names targets not found in the Makefile: {', '.join(unknown_include)}",
                 file=sys.stderr,
             )
 
-    unknown_exclude = sorted(exclude - all_targets.keys())
+    unknown_exclude = sorted(name for name in exclude if name and name not in all_targets)
     if unknown_exclude:
         raise ValueError(f"--exclude names targets not found in the Makefile: {', '.join(unknown_exclude)}")
 

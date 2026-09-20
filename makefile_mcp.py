@@ -372,6 +372,37 @@ def validate_tool_names(targets: Dict[str, str]) -> None:
         raise ValueError(f"Conflicting make targets generate the same MCP tool name: {details}")
 
 
+def validate_filter_names(all_targets: Dict[str, str], include: Optional[Set[str]], exclude: Set[str]) -> None:
+    """Check the --include/--exclude names against the targets the Makefile actually has.
+
+    The two halves are deliberately asymmetric. An unknown --exclude name fails OPEN:
+    the target the operator meant to hide stays registered as a callable tool, and the
+    exclude filter is this server's exposure boundary, so a typo or a since-renamed
+    target is startup misconfiguration and refuses to serve. An unknown --include name
+    fails CLOSED — it simply contributes nothing — so it is a usability problem rather
+    than a safety one, and hard-failing it would break a single client configuration
+    pointed at several Makefiles with different target sets: it warns and starts.
+
+    An empty name is skipped rather than reported: a trailing or doubled comma
+    ("deploy,") leaves one in the parsed set, it can never match a make target, and
+    reporting it would exit with a diagnostic that names nothing.
+
+    Raises:
+        ValueError: if --exclude names any target the Makefile does not define.
+    """
+    if include is not None:
+        unknown_include = sorted(name for name in include if name and name not in all_targets)
+        if unknown_include:
+            print(
+                f"Warning: --include names targets not found in the Makefile: {', '.join(unknown_include)}",
+                file=sys.stderr,
+            )
+
+    unknown_exclude = sorted(name for name in exclude if name and name not in all_targets)
+    if unknown_exclude:
+        raise ValueError(f"--exclude names targets not found in the Makefile: {', '.join(unknown_exclude)}")
+
+
 # A command-line make variable assignment: NAME=value, NAME:=value, NAME::=value,
 # NAME+=value, NAME?=value, NAME!=value. These override variables and cannot select
 # another target, load another makefile, or change directory. Their values are still
@@ -852,6 +883,16 @@ def initialize_makefile_mcp(argv: Optional[List[str]] = None) -> MakefileServer:
 
     if not config.working_dir.is_dir():
         print(f"Error: Working directory not found: {config.working_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        validate_filter_names(
+            MakefileParser(config.makefile_path).get_targets(),
+            config.include_targets,
+            config.exclude_targets,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     server = MakefileServer(config)

@@ -1759,5 +1759,111 @@ class TestSingleToolRegistration:
         assert second.filtered_targets == {"build": "Build it", "test": "Test it"}
 
 
+class TestFilterNameValidation:
+    """--include/--exclude names are checked against the targets the Makefile defines."""
+
+    MODULE_PATH = pathlib.Path(__file__).resolve().parent.parent / "makefile_mcp.py"
+    MAKEFILE_CONTENT = "# Build it\nbuild:\n\techo build\n\n# Ship it\ndeploy:\n\techo deploy\n"
+
+    @pytest.fixture
+    def makefile(self, tmp_path):
+        path = tmp_path / "Makefile"
+        path.write_text(self.MAKEFILE_CONTENT)
+        return path
+
+    def test_unknown_exclude_name_exits(self, makefile, capsys):
+        """An --exclude name absent from the Makefile refuses to start, naming every unknown entry."""
+        with pytest.raises(SystemExit) as excinfo:
+            makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--exclude", "publsh,deploy,releese"])
+
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        # Both unknown names are reported, not just the first one encountered.
+        assert "publsh" in err
+        assert "releese" in err
+        # The name that does exist is not reported as unknown.
+        assert "deploy," not in err.replace("--exclude", "")
+
+    def test_unknown_include_name_warns_and_starts(self, makefile, capsys):
+        """An unknown --include name warns on stderr; the known names still register."""
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--include", "build,tets"])
+
+        err = capsys.readouterr().err
+        assert "tets" in err
+        assert "Warning:" in err
+        assert server.filtered_targets == {"build": "Build it"}
+
+    def test_exclude_of_already_included_out_target_is_accepted(self, makefile, capsys):
+        """Excluding a real target that --include already filtered out is a legitimate config.
+
+        This guards the ARGUMENT SOURCE rather than the exclude logic: validation must
+        read the unfiltered target set, so `deploy` — real, but not in the include set —
+        is not mistaken for a typo.
+        """
+        server = makefile_mcp.initialize_makefile_mcp(
+            ["--makefile", str(makefile), "--include", "build", "--exclude", "deploy"]
+        )
+
+        assert server.filtered_targets == {"build": "Build it"}
+        assert "not found in the Makefile" not in capsys.readouterr().err
+
+    def test_known_filter_names_are_silent(self, makefile, capsys):
+        """A correctly-spelled filter pair produces no diagnostic at all."""
+        server = makefile_mcp.initialize_makefile_mcp(
+            ["--makefile", str(makefile), "--include", "build,deploy", "--exclude", "deploy"]
+        )
+
+        assert server.filtered_targets == {"build": "Build it"}
+        assert capsys.readouterr().err == ""
+
+    def test_no_filters_validates_cleanly(self, makefile, capsys):
+        """With neither filter set there is nothing to check and nothing to report."""
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile)])
+
+        assert set(server.filtered_targets) == {"build", "deploy"}
+        assert capsys.readouterr().err == ""
+
+    def test_include_warning_precedes_the_empty_target_exit(self, makefile, capsys):
+        """When every --include name is a typo, the diagnostic still prints before the exit.
+
+        Ordering is the whole point: the filtered set comes out empty, so without
+        validating first the operator would only see "No make targets available".
+        """
+        with pytest.raises(SystemExit):
+            makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--include", "tets"])
+
+        err = capsys.readouterr().err
+        assert err.index("tets") < err.index("No make targets available")
+
+    def test_direct_script_startup_rejects_unknown_exclude(self, makefile, capsys):
+        """The real `uv run makefile_mcp.py` lifecycle is gated too, not just the callable.
+
+        Drives the module as __main__ so the check is proven to be wired into startup
+        rather than merely importable.
+        """
+        import fastmcp
+
+        argv = ["makefile_mcp.py", "--makefile", str(makefile), "--exclude", "publsh"]
+        with patch("sys.argv", argv), patch.object(fastmcp.FastMCP, "run") as run:
+            with pytest.raises(SystemExit) as excinfo:
+                runpy.run_path(str(self.MODULE_PATH), run_name="__main__")
+
+        assert excinfo.value.code == 1
+        assert "publsh" in capsys.readouterr().err
+        run.assert_not_called()
+
+    def test_validate_filter_names_is_callable_at_module_level(self):
+        """The check is a module-level function over the unfiltered target mapping."""
+        all_targets = {"build": "Build it", "deploy": "Ship it"}
+
+        makefile_mcp.validate_filter_names(all_targets, None, set())
+        makefile_mcp.validate_filter_names(all_targets, {"build"}, {"deploy"})
+
+        with pytest.raises(ValueError) as excinfo:
+            makefile_mcp.validate_filter_names(all_targets, None, {"zzz", "aaa"})
+        # Sorted, so the message is deterministic despite the filters being sets.
+        assert str(excinfo.value).endswith("aaa, zzz")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

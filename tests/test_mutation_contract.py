@@ -520,6 +520,67 @@ class TestInitializationFailures:
         )
 
 
+class TestFilterNameDiagnostics:
+    """Pin the exact stderr text and exit code of the include/exclude name checks."""
+
+    TWO_TARGETS = "# Build\nbuild:\n\ttrue\n# Ship\ndeploy:\n\ttrue\n"
+
+    def test_unknown_exclude_message(self, tmp_path, capsys):
+        makefile = write_makefile(tmp_path, self.TWO_TARGETS)
+        with pytest.raises(SystemExit) as excinfo:
+            makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--exclude", "publsh,deploy,aaa"])
+        assert excinfo.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.err == "Error: --exclude names targets not found in the Makefile: aaa, publsh\n"
+        assert captured.out == ""
+
+    def test_unknown_include_message(self, tmp_path, capsys):
+        makefile = write_makefile(tmp_path, self.TWO_TARGETS)
+        server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--include", "build,tets,aaa"])
+        captured = capsys.readouterr()
+        assert captured.err == "Warning: --include names targets not found in the Makefile: aaa, tets\n"
+        assert captured.out == ""
+        assert server.filtered_targets == {"build": "Build"}
+
+    def test_both_filters_wrong_reports_include_before_exiting_on_exclude(self, tmp_path, capsys):
+        """The include warning is emitted first so a doubly-mistyped config reports both problems."""
+        makefile = write_makefile(tmp_path, self.TWO_TARGETS)
+        with pytest.raises(SystemExit) as excinfo:
+            makefile_mcp.initialize_makefile_mcp(
+                ["--makefile", str(makefile), "--include", "tets", "--exclude", "publsh"]
+            )
+        assert excinfo.value.code == 1
+        assert capsys.readouterr().err == (
+            "Warning: --include names targets not found in the Makefile: tets\n"
+            "Error: --exclude names targets not found in the Makefile: publsh\n"
+        )
+
+    def test_trailing_comma_is_not_an_unknown_name(self, tmp_path, capsys):
+        """A trailing or doubled comma leaves an empty name in the parsed set; it is not reported.
+
+        Without this the server would exit on `--exclude deploy,` with a diagnostic that
+        names nothing — a config that worked before the check was added.
+        """
+        makefile = write_makefile(tmp_path, self.TWO_TARGETS)
+        server = makefile_mcp.initialize_makefile_mcp(
+            ["--makefile", str(makefile), "--include", "build,deploy,", "--exclude", "deploy,,"]
+        )
+        assert capsys.readouterr().err == ""
+        assert server.filtered_targets == {"build": "Build"}
+
+    def test_empty_include_filter_only_message(self, tmp_path, capsys):
+        """A fully mistyped --include warns, then exits on the empty filtered set."""
+        makefile = write_makefile(tmp_path, self.TWO_TARGETS)
+        with pytest.raises(SystemExit) as excinfo:
+            makefile_mcp.initialize_makefile_mcp(["--makefile", str(makefile), "--include", "tets"])
+        assert excinfo.value.code == 1
+        assert capsys.readouterr().err == (
+            "Warning: --include names targets not found in the Makefile: tets\n"
+            "Warning: No targets found or all targets filtered out\n"
+            "Error: No make targets available to expose as tools\n"
+        )
+
+
 class TestStartupBanner:
     """Pin the stderr banner main() prints before serving."""
 

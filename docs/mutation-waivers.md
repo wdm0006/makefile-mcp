@@ -62,6 +62,15 @@ multi-token inputs. Killed by `TestAllowlistScanner::test_accepted_shapes` cases
 `["--debug", "--output-sync", "--debug"]`, `["-ssk"]`, `["-kss"]`) hanging until
 pytest-timeout fires.
 
+## Later additions — campaigned, no survivors
+
+`validate_filter_names` (startup check of the `--include`/`--exclude` names against the
+discovered targets): a scoped campaign over its 16 mutants
+(`python -m mutmut run 'makefile_mcp.x_validate_filter_names__mutmut_*'`) killed every
+one — 0 survivors, nothing to waive. Covered by
+`tests/test_makefile_mcp.py::TestFilterNameValidation` and
+`tests/test_mutation_contract.py::TestFilterNameDiagnostics`.
+
 ## Survivors killed during this PR's campaign (for the record)
 
 Three rounds of contract tests (`tests/test_mutation_contract.py`,

@@ -12,7 +12,7 @@ A Model Context Protocol (MCP) server that exposes Makefile targets as executabl
 - **Target discovery**: Makefiles are parsed automatically to discover targets and descriptions
 - **Comment-based descriptions**: comments above a target become its tool description
 - **Include/exclude filtering**: `--include` and `--exclude` control which targets are exposed as tools
-- **Dry-run mode**: call any target tool with `dry_run=true` to see the commands make would run without executing them (a tool parameter — the server itself takes no `--dry-run` CLI flag)
+- **Dry-run mode**: call any target tool with `dry_run=true` to preview recipes with make's `-n`; Makefile expansion and recursive make may still have side effects (a tool parameter — the server itself takes no `--dry-run` CLI flag)
 - **Bounded responses, full output retained**: inline responses carry a configurable tail of each stream plus line/char totals; the complete output stays addressable through the `execution_id`
 
 ## Install
@@ -104,7 +104,7 @@ Every server exposes four utility tools plus one `make_<target>` tool per discov
 Executes `make -C <working-dir> -f <makefile> <target>`.
 
 - `additional_args` — a string of extra make arguments (e.g. `"-j4 VERBOSE=1"`). Validated against the security allowlist below before make runs.
-- `dry_run` — when `true`, make runs with `-n`: it prints the commands it would execute without running them. This is a **tool parameter**, not a CLI flag of the server process.
+- `dry_run` — when `true`, make runs with `-n`: it prints recipes without ordinary execution, but Makefile expansion (including `$(shell ...)`) and recursive make may still have side effects. This is a **tool parameter**, not a CLI flag of the server process.
 - The response carries `status`, `exit_code`, the exact `command`, `working_directory`, a bounded tail of stdout/stderr with line/char totals, and an `execution_id` addressing the full cached output.
 - A target killed by the timeout returns `status: "error"` with a timeout message and `exit_code: -1`; whatever it printed before the kill is cached and readable via `get_output`/`search_output`.
 

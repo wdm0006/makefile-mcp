@@ -613,7 +613,10 @@ class MakefileServer:
                 }
 
                 if dry_run:
-                    response["note"] = "This was a dry run - no commands were actually executed"
+                    response["note"] = (
+                        "This was a make -n preview: recipes are printed without ordinary execution, "
+                        "but Makefile expansion and recursive make may still have side effects."
+                    )
 
                 if result.returncode == 0:
                     response["status"] = "success"

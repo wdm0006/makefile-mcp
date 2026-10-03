@@ -582,11 +582,22 @@ class TestMakefileMCPServer:
         result = make_tool(dry_run=True)
 
         assert result["status"] == "success"
-        assert result["note"] == "This was a dry run - no commands were actually executed"
+        assert result["note"] == (
+            "This was a make -n preview: recipes are printed without ordinary execution, "
+            "but Makefile expansion and recursive make may still have side effects."
+        )
 
         # Verify -n flag was added for dry run
         call_args = mock_run.call_args[0][0]
-        assert "-n" in call_args
+        assert call_args == [
+            "make",
+            "-C",
+            str(server.config.working_dir),
+            "-f",
+            str(server.config.makefile_path),
+            "build",
+            "-n",
+        ]
 
     @patch("subprocess.run")
     def test_make_tool_with_additional_args(self, mock_run, server_factory):
@@ -1863,6 +1874,29 @@ class TestFilterNameValidation:
             makefile_mcp.validate_filter_names(all_targets, None, {"zzz", "aaa"})
         # Sorted, so the message is deterministic despite the filters being sets.
         assert str(excinfo.value).endswith("aaa, zzz")
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="requires a make executable")
+class TestRealMakeDryRun:
+    def test_preview_warns_about_expansion_side_effects(self, tmp_path, server_factory):
+        server = server_factory("preview:\n\t@echo $(shell touch expansion-marker)done\n\t@touch recipe-marker\n")
+        expansion_marker = tmp_path / "expansion-marker"
+        recipe_marker = tmp_path / "recipe-marker"
+        assert not expansion_marker.exists()
+        assert not recipe_marker.exists()
+
+        result = server.create_make_tool("preview", "Preview the recipe")(dry_run=True)
+
+        assert expansion_marker.exists()
+        assert not recipe_marker.exists()
+        assert result["status"] == "success"
+        assert result["exit_code"] == 0
+        assert "echo done" in result["stdout_tail"].splitlines()
+        assert "touch recipe-marker" in result["stdout_tail"].splitlines()
+        assert result["command"] == f"make -C {tmp_path} -f {server.config.makefile_path} preview -n"
+        assert "make -n preview" in result["note"]
+        assert "Makefile expansion and recursive make may still have side effects" in result["note"]
+        assert "no commands were actually executed" not in result["note"]
 
 
 if __name__ == "__main__":

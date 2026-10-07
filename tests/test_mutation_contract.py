@@ -488,6 +488,58 @@ class TestOutputBounding:
             "Use get_output(execution_id=7) to paginate or search_output() to search the full output."
         )
 
+    def test_single_huge_line_is_capped_to_its_end(self):
+        cap = makefile_mcp.MAX_INLINE_TAIL_CHARS
+        text = "a" * 5_000_000 + "END\n"
+        tail, truncated = makefile_mcp._tail_lines(text, 50)
+        assert truncated is True
+        assert len(tail) == cap
+        assert tail.endswith("END\n")
+
+    def test_text_at_char_cap_is_unchanged(self):
+        text = "x" * makefile_mcp.MAX_INLINE_TAIL_CHARS
+        assert makefile_mcp._tail_lines(text, 50) == (text, False)
+
+    def test_char_cap_applies_after_line_selection(self):
+        cap = makefile_mcp.MAX_INLINE_TAIL_CHARS
+        text = "first\n" + "b" * (cap + 10) + "\n"
+        tail, truncated = makefile_mcp._tail_lines(text, 1)
+        assert truncated is True
+        assert len(tail) == cap
+
+    def test_huge_line_fields_for_both_streams(self):
+        cap = makefile_mcp.MAX_INLINE_TAIL_CHARS
+        big = "z" * 5_000_000
+        fields = makefile_mcp._bounded_output_fields(big, big, 50, 3)
+        assert len(fields["stdout_tail"]) == cap
+        assert len(fields["stderr_tail"]) == cap
+        assert fields["stdout_total_chars"] == 5_000_000
+        assert fields["stderr_total_chars"] == 5_000_000
+        assert fields["truncation_note"] == (
+            f"Output was truncated to the last 50 lines and at most {cap} characters per stream. "
+            "Use get_output(execution_id=3) to paginate or search_output() to search the full output."
+        )
+
+    def test_stderr_only_huge_line_is_noted(self):
+        fields = makefile_mcp._bounded_output_fields("ok\n", "e" * 30_000, 50, 1)
+        assert fields["stdout_tail"] == "ok\n"
+        assert len(fields["stderr_tail"]) == makefile_mcp.MAX_INLINE_TAIL_CHARS
+        assert "characters per stream" in fields["truncation_note"]
+
+    def test_timeout_path_caps_huge_line(self, tmp_path):
+        mk = tmp_path / "Makefile"
+        mk.write_text("slow:\n\t@true\n")
+        error = subprocess.TimeoutExpired("make", 300, output=b"q" * 100_000, stderr=b"r" * 100_000)
+        with patch("subprocess.run", side_effect=error):
+            server = makefile_mcp.initialize_makefile_mcp(["--makefile", str(mk)])
+            result = server.create_make_tool("slow", "d")()
+        cap = makefile_mcp.MAX_INLINE_TAIL_CHARS
+        assert result["exit_code"] == -1
+        assert len(result["stdout_tail"]) == cap
+        assert len(result["stderr_tail"]) == cap
+        assert result["stdout_total_chars"] == 100_000
+        assert "characters per stream" in result["truncation_note"]
+
 
 class TestInitializationFailures:
     """Pin exit code 1 and the exact stderr message for each failure mode."""

@@ -32,6 +32,10 @@ from fastmcp import FastMCP
 # that need more can raise max_results or page with get_output().
 DEFAULT_MAX_SEARCH_RESULTS = 20
 
+# --tail-lines alone cannot bound a single enormous line, so each inline tail is
+# also capped at this many characters (the END of the text is kept).
+MAX_INLINE_TAIL_CHARS = 20_000
+
 
 @dataclass
 class CachedExecution:
@@ -286,13 +290,15 @@ def get_makefile_targets(config: ServerConfig) -> Dict[str, str]:
 
 
 def _tail_lines(text: str, n: int) -> tuple[str, bool]:
-    """Return the last n lines of text. Returns (tail_text, was_truncated)."""
+    """Return the last n lines of text, capped at MAX_INLINE_TAIL_CHARS. Returns (tail_text, was_truncated)."""
     if not text:
         return text, False
     lines = text.splitlines(keepends=True)
-    if len(lines) <= n:
-        return text, False
-    return "".join(lines[-n:]), True
+    truncated = len(lines) > n
+    tail = "".join(lines[-n:]) if truncated else text
+    if len(tail) > MAX_INLINE_TAIL_CHARS:
+        return tail[-MAX_INLINE_TAIL_CHARS:], True
+    return tail, truncated
 
 
 def _bounded_output_fields(stdout: str, stderr: str, tail_n: int, execution_id: int) -> Dict[str, Any]:
@@ -311,9 +317,15 @@ def _bounded_output_fields(stdout: str, stderr: str, tail_n: int, execution_id: 
     }
 
     if stdout_truncated or stderr_truncated:
+        char_clause = (
+            f" and at most {MAX_INLINE_TAIL_CHARS} characters per stream"
+            if len(stdout_tail) == MAX_INLINE_TAIL_CHARS or len(stderr_tail) == MAX_INLINE_TAIL_CHARS
+            else ""
+        )
         fields["truncation_note"] = (
             "Output was truncated to the last "
-            f"{tail_n} lines. Use get_output(execution_id={execution_id}) "
+            f"{tail_n} lines"
+            f"{char_clause}. Use get_output(execution_id={execution_id}) "
             "to paginate or search_output() to search the full output."
         )
 

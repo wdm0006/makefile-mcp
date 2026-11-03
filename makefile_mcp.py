@@ -36,6 +36,15 @@ DEFAULT_MAX_SEARCH_RESULTS = 20
 # also capped at this many characters (the END of the text is kept).
 MAX_INLINE_TAIL_CHARS = 20_000
 
+ADDITIONAL_ARGS_HINT = (
+    "additional_args accepts only literal NAME=value assignments (e.g. VERBOSE=1) and the execution flags "
+    "-B -d -e -i -j[N] -k -l[N] -n -O -q -R -r -s -w or --keep-going, --silent, --quiet, --ignore-errors, "
+    "--dry-run, --just-print, --recon, --print-directory, --no-print-directory, --always-make, "
+    "--no-builtin-rules, --no-builtin-variables, --environment-overrides, --question, --trace, "
+    "--warn-undefined-variables, --jobs[=N], --load-average[=N], --max-load[=N], --output-sync[=TYPE], "
+    "--debug[=FLAGS]. Target names, --, and other options are rejected."
+)
+
 
 @dataclass
 class CachedExecution:
@@ -578,6 +587,8 @@ class MakefileServer:
                         "status": "error",
                         "message": f"Invalid additional_args for target '{target_name}': {str(e)}",
                         "exit_code": -1,
+                        "additional_args": additional_args,
+                        "hint": ADDITIONAL_ARGS_HINT,
                     }
 
                 arg_error = validate_additional_args(extra_args)
@@ -587,6 +598,8 @@ class MakefileServer:
                         "status": "error",
                         "message": f"Rejected additional_args for target '{target_name}': {arg_error}",
                         "exit_code": -1,
+                        "additional_args": additional_args,
+                        "hint": ADDITIONAL_ARGS_HINT,
                     }
 
             try:

@@ -289,16 +289,31 @@ class TestToolResponseContract:
     def test_make_tool_argument_error_contract(self, server_factory):
         server = server_factory()
         tool = server.create_make_tool("build", "Build the project")
-        shlex_error = tool(additional_args="'unterminated")
-        assert shlex_error["target"] == "build"
-        assert shlex_error["status"] == "error"
-        assert shlex_error["message"] == "Invalid additional_args for target 'build': No closing quotation"
-        rejected = tool(additional_args="clean")
-        assert rejected["target"] == "build"
-        assert rejected["message"] == (
-            "Rejected additional_args for target 'build': "
-            "'clean' is not an allowed variable assignment or option (it would select another target)"
-        )
+        with patch("makefile_mcp.subprocess.run") as mock_run:
+            shlex_error = tool(additional_args="'unterminated")
+            rejected = tool(additional_args="clean")
+        mock_run.assert_not_called()
+        assert shlex_error == {
+            "target": "build",
+            "status": "error",
+            "message": "Invalid additional_args for target 'build': No closing quotation",
+            "exit_code": -1,
+            "additional_args": "'unterminated",
+            "hint": makefile_mcp.ADDITIONAL_ARGS_HINT,
+        }
+        assert rejected == {
+            "target": "build",
+            "status": "error",
+            "message": (
+                "Rejected additional_args for target 'build': "
+                "'clean' is not an allowed variable assignment or option (it would select another target)"
+            ),
+            "exit_code": -1,
+            "additional_args": "clean",
+            "hint": makefile_mcp.ADDITIONAL_ARGS_HINT,
+        }
+        assert makefile_mcp.ADDITIONAL_ARGS_HINT
+        assert "execution_id" not in shlex_error and "execution_id" not in rejected
 
     def test_make_tool_os_error_message(self, server_factory):
         server = server_factory()

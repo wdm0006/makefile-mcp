@@ -1176,7 +1176,7 @@ class TestOutputCache:
 
     def test_byte_accounting_has_no_drift_after_count_eviction(self):
         cache = self._get_cache(max_entries=2, max_bytes=10)
-        for i in range(6):
+        for _ in range(6):
             cache.add("t", "make t", "ab", "c", 0)
         assert cache._total_bytes == 6
         cache.add("t", "make t", "1234", "1234", 0)  # 6 + 8 > 10 -> evict one

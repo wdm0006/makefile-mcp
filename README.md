@@ -74,6 +74,7 @@ different target sets.
 | `--exclude a,b` | none | hide these targets; an unknown name is a startup error |
 | `--working-dir PATH` | the Makefile's directory | directory make runs in |
 | `--max-cached-executions N` | `20` | how many executions stay cached; the oldest is evicted first, so old `execution_id`s eventually expire |
+| `--max-cache-bytes N` | `67108864` (64 MiB) | total UTF-8 bytes of cached stdout and stderr; the oldest executions are evicted first, but the newest is always kept even if it alone exceeds the budget |
 | `--tail-lines N` | `50` | lines of each stream included inline in make tool responses |
 | `--timeout SECONDS` | `300` | kill a running target after this many seconds; the timeout is reported as an error and any partial output is still cached |
 

@@ -35,6 +35,7 @@ DEFAULT_MAX_SEARCH_RESULTS = 20
 # --tail-lines alone cannot bound a single enormous line, so each inline tail is
 # also capped at this many characters (the END of the text is kept).
 MAX_INLINE_TAIL_CHARS = 20_000
+MAX_OUTPUT_PAGE_CHARS = 20_000
 
 
 @dataclass
@@ -299,6 +300,18 @@ def _tail_lines(text: str, n: int) -> tuple[str, bool]:
     if len(tail) > MAX_INLINE_TAIL_CHARS:
         return tail[-MAX_INLINE_TAIL_CHARS:], True
     return tail, truncated
+
+
+def _bounded_page(selected: list[str], start_line: int) -> tuple[str, int, bool]:
+    """Join lines up to MAX_OUTPUT_PAGE_CHARS. Returns (content, exclusive end line, was_capped)."""
+    total = 0
+    for count, line in enumerate(selected):
+        if total + len(line) > MAX_OUTPUT_PAGE_CHARS:
+            if count == 0:
+                return line[:MAX_OUTPUT_PAGE_CHARS], start_line + 1, True
+            return "".join(selected[:count]), start_line + count, True
+        total += len(line)
+    return "".join(selected), start_line + len(selected), False
 
 
 def _bounded_output_fields(stdout: str, stderr: str, tail_n: int, execution_id: int) -> Dict[str, Any]:
@@ -757,7 +770,10 @@ class MakefileServer:
             end_line: Last line to return (exclusive).
 
         Returns:
-            dict: The requested lines and metadata.
+            dict: The requested lines and metadata. A page's content is capped at 20,000 characters: whole
+            lines up to the cap, or the leading slice of the first line if it alone exceeds it. `truncated`
+            says whether the cap bit, `end_line` is then the actual exclusive end, `next_start_line` is the
+            line to request next (null when no lines remain), and `truncation_note` explains the cap.
         """
         lookup = _lookup_cached_stream(self.output_cache, execution_id, stream)
         if isinstance(lookup, dict):
@@ -772,9 +788,8 @@ class MakefileServer:
         start_line = max(0, start_line)
         end_line = max(start_line, min(end_line, total_lines))
 
-        selected = lines[start_line:end_line]
-
-        return {
+        content, end_line, truncated = _bounded_page(lines[start_line:end_line], start_line)
+        result: Dict[str, Any] = {
             "status": "success",
             "execution_id": execution_id,
             "target": cached.target,
@@ -782,8 +797,18 @@ class MakefileServer:
             "start_line": start_line,
             "end_line": end_line,
             "total_lines": total_lines,
-            "content": "".join(selected),
+            "content": content,
+            "truncated": truncated,
+            "next_start_line": end_line if end_line < total_lines else None,
         }
+        if truncated:
+            result["truncation_note"] = (
+                f"Page was capped at {MAX_OUTPUT_PAGE_CHARS} characters. "
+                f"Call get_output(execution_id={execution_id}, stream={stream!r}, start_line={end_line}) "
+                "to continue; if a single line exceeded the cap, only its leading characters were returned "
+                "and the remainder of that line is not retrievable through get_output."
+            )
+        return result
 
     def search_output(
         self,

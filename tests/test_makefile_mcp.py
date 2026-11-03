@@ -1262,6 +1262,53 @@ class TestTailTruncation:
         assert isinstance(result["execution_id"], int)
 
 
+class TestGetOutputPageCap:
+    """get_output pages are capped by characters as well as lines."""
+
+    def _add(self, server_factory, stdout):
+        server = server_factory()
+        return server, server.output_cache.add("t", "make t", stdout, "", 0).execution_id
+
+    def test_single_oversized_line_returns_leading_slice(self, server_factory):
+        cap = makefile_mcp.MAX_OUTPUT_PAGE_CHARS
+        big = "x" * 100_000
+        server, eid = self._add(server_factory, big + "\nafter\n")
+        page = server.get_output(eid, start_line=0, end_line=100)
+        assert page["content"] == big[:cap]
+        assert page["truncated"] is True
+        assert page["end_line"] == 1
+        assert page["next_start_line"] == 1
+        assert "20000" in page["truncation_note"]
+        rest = server.get_output(eid, start_line=1, end_line=100)
+        assert rest["content"] == "after\n"
+        assert rest["truncated"] is False
+        assert rest["next_start_line"] is None
+        assert "truncation_note" not in rest
+
+    def test_under_cap_page_unchanged(self, server_factory):
+        text = "".join(f"line{i}\n" for i in range(20))
+        server, eid = self._add(server_factory, text)
+        page = server.get_output(eid, start_line=0, end_line=100)
+        assert page["content"] == text
+        assert page["truncated"] is False
+        assert page["next_start_line"] is None
+        assert page["end_line"] == 20
+        assert "truncation_note" not in page
+
+    def test_following_next_start_line_reassembles_exactly(self, server_factory):
+        text = "".join(f"{i:04d}-" + "y" * 95 + "\n" for i in range(1000))
+        server, eid = self._add(server_factory, text)
+        pieces, start, pages = [], 0, 0
+        while start is not None:
+            page = server.get_output(eid, start_line=start, end_line=1000)
+            assert len(page["content"]) <= makefile_mcp.MAX_OUTPUT_PAGE_CHARS
+            pieces.append(page["content"])
+            start = page["next_start_line"]
+            pages += 1
+        assert pages > 1
+        assert "".join(pieces) == text
+
+
 class TestGetOutput:
     """Test the get_output MCP tool."""
 

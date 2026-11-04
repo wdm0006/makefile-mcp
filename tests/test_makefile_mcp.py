@@ -801,7 +801,7 @@ class TestCommandLineArguments:
 
         assert args.working_dir == "/custom/work/dir"
 
-    @pytest.mark.parametrize("option", ["--max-cached-executions", "--tail-lines"])
+    @pytest.mark.parametrize("option", ["--max-cached-executions", "--max-cache-bytes", "--tail-lines"])
     @pytest.mark.parametrize("value", ["0", "-1"])
     def test_output_limits_must_be_positive(self, option, value, capsys):
         """Test output limits reject zero and negative values."""
@@ -1103,10 +1103,10 @@ class TestConfigurableTimeout:
 class TestOutputCache:
     """Test the OutputCache class."""
 
-    def _get_cache(self, max_entries=20):
+    def _get_cache(self, max_entries=20, max_bytes=64 * 1024 * 1024):
         from makefile_mcp import OutputCache
 
-        return OutputCache(max_entries=max_entries)
+        return OutputCache(max_entries=max_entries, max_bytes=max_bytes)
 
     def test_add_and_get(self):
         """Test adding and retrieving entries."""
@@ -1146,6 +1146,42 @@ class TestOutputCache:
         assert cache.get(1) is None
         assert cache.get(2) is not None
         assert cache.get(4) is not None
+
+    def test_byte_budget_evicts_oldest_first(self):
+        cache = self._get_cache(max_bytes=10)
+        cache.add("a", "make a", "1234", "", 0)
+        cache.add("b", "make b", "123", "123", 0)
+        assert len(cache) == 2
+        cache.add("c", "make c", "12", "", 0)
+        assert cache.get(1) is None
+        assert cache.get(2) is not None
+        assert cache.get(3) is not None
+
+    def test_byte_budget_counts_utf8_bytes(self):
+        cache = self._get_cache(max_bytes=7)
+        cache.add("a", "make a", "\u00e9\u00e9", "\u00e9", 0)  # 6 bytes
+        cache.add("b", "make b", "ab", "", 0)  # 8 total > 7
+        assert cache.get(1) is None
+        assert cache.get(2) is not None
+
+    def test_oversized_newest_entry_survives(self):
+        cache = self._get_cache(max_bytes=5)
+        cache.add("a", "make a", "12", "", 0)
+        big = cache.add("b", "make b", "x" * 100, "y" * 100, 0)
+        assert len(cache) == 1
+        assert cache.get(big.execution_id) is big
+        nxt = cache.add("c", "make c", "z", "", 0)
+        assert cache.get(big.execution_id) is None
+        assert cache.get(nxt.execution_id) is nxt
+
+    def test_byte_accounting_has_no_drift_after_count_eviction(self):
+        cache = self._get_cache(max_entries=2, max_bytes=10)
+        for _ in range(6):
+            cache.add("t", "make t", "ab", "c", 0)
+        assert cache._total_bytes == 6
+        cache.add("t", "make t", "1234", "1234", 0)  # 6 + 8 > 10 -> evict one
+        assert len(cache) == 1
+        assert cache._total_bytes == 8
 
     def test_get_missing_id(self):
         """Test that getting a non-existent ID returns None."""

@@ -61,6 +61,7 @@ class TestCliDefaults:
         args = makefile_mcp.parse_cli_args([])
         assert args.makefile == "Makefile"
         assert args.max_cached_executions == 20
+        assert args.max_cache_bytes == 64 * 1024 * 1024
         assert args.tail_lines == 50
         assert args.timeout == 300
 

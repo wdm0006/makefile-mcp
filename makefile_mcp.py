@@ -46,6 +46,9 @@ ADDITIONAL_ARGS_HINT = (
     "--debug[=FLAGS]. Target names, --, and other options are rejected."
 )
 
+# Default byte budget (UTF-8 stdout + stderr) for the whole output cache.
+DEFAULT_MAX_CACHE_BYTES = 64 * 1024 * 1024
+
 
 @dataclass
 class CachedExecution:
@@ -67,8 +70,10 @@ class OutputCache:
     to the cache is serialized by a lock.
     """
 
-    def __init__(self, max_entries: int = 20):
+    def __init__(self, max_entries: int = 20, max_bytes: int = DEFAULT_MAX_CACHE_BYTES):
         self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self._total_bytes = 0
         self._cache: Dict[int, CachedExecution] = {}
         self._next_id: int = 1
         self._lock = threading.Lock()
@@ -89,13 +94,18 @@ class OutputCache:
                 timestamp=time.time(),
             )
             self._cache[execution_id] = entry
+            self._total_bytes += self._entry_bytes(entry)
 
-            # Evict oldest entries if over limit
-            while len(self._cache) > self.max_entries:
+            # Evict oldest entries while over either limit, always keeping the newest
+            while len(self._cache) > self.max_entries or (self._total_bytes > self.max_bytes and len(self._cache) > 1):
                 oldest_id = min(self._cache.keys())
-                del self._cache[oldest_id]
+                self._total_bytes -= self._entry_bytes(self._cache.pop(oldest_id))
 
             return entry
+
+    @staticmethod
+    def _entry_bytes(entry: CachedExecution) -> int:
+        return len(entry.stdout.encode("utf-8", "replace")) + len(entry.stderr.encode("utf-8", "replace"))
 
     def get(self, execution_id: int) -> Optional[CachedExecution]:
         """Retrieve a cached execution by ID."""
@@ -120,6 +130,7 @@ class ServerConfig:
     include_targets: Optional[Set[str]]
     exclude_targets: Set[str]
     max_cached_executions: int
+    max_cache_bytes: int
     tail_lines: int
     timeout_seconds: int
 
@@ -157,6 +168,13 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=positive_int,
         default=20,
         help="Maximum number of cached execution outputs to keep (default: 20)",
+    )
+    parser.add_argument(
+        "--max-cache-bytes",
+        type=positive_int,
+        default=DEFAULT_MAX_CACHE_BYTES,
+        help="Maximum total bytes of cached stdout/stderr; oldest executions are evicted first, "
+        "but the newest is always kept (default: 67108864, i.e. 64 MiB)",
     )
     parser.add_argument(
         "--tail-lines",
@@ -198,6 +216,7 @@ def build_config(cli_args: argparse.Namespace) -> ServerConfig:
         include_targets=_parse_target_list(cli_args.include),
         exclude_targets=_parse_target_list(cli_args.exclude) or set(),
         max_cached_executions=cli_args.max_cached_executions,
+        max_cache_bytes=cli_args.max_cache_bytes,
         tail_lines=cli_args.tail_lines,
         timeout_seconds=cli_args.timeout,
     )
@@ -573,7 +592,7 @@ class MakefileServer:
     def __init__(self, config: ServerConfig):
         self.config = config
         self.mcp_server = FastMCP("MakefileMCP")
-        self.output_cache = OutputCache(max_entries=config.max_cached_executions)
+        self.output_cache = OutputCache(max_entries=config.max_cached_executions, max_bytes=config.max_cache_bytes)
         self.filtered_targets: Dict[str, str] = get_makefile_targets(config)
         self._register_utility_tools()
 

@@ -341,7 +341,11 @@ class TestToolResponseContract:
             "end_line",
             "total_lines",
             "content",
+            "truncated",
+            "next_start_line",
         }
+        assert page["truncated"] is False
+        assert page["next_start_line"] == 100
         assert page["start_line"] == 0
         assert page["end_line"] == 100
         assert page["total_lines"] == 150
